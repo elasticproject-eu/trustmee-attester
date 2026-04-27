@@ -26,6 +26,20 @@ std::fs::write("input.cmw.json", built.cmw_json_bytes)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### Obtaining attestation evidence in Confidential Containers
+
+In your main project's `Cargo.toml` set `attestation-input-format = { ... features = ["confidential-containers"] }` under `[dependencies]`
+
+Call the function with
+
+```rust
+let trustmee_builder_client = trustmee_coco_client::CocoClient::builder().build()?; // can .url() and .timeout() options can be specified if not using default
+
+let trustmee_evidence = trustmee_builder_client.build_trustmee_json_cmw_coco(Some(runtime_data.as_bytes()), verifier_component_id, verifier_component, evidence_media_type, edorsements).await?;?; //all parameters are optional
+```
+
+
+
 ## CLI
 
 Build TrustMee JSON CMW (trustmee-lib expected input):
