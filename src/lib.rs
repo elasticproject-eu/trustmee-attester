@@ -414,13 +414,12 @@ pub mod trustmee_coco_client {
             
             // Append the runtime data exactly as a UTF-8 string to satisfy the AA/TDX hardware
             if let Some(bytes) = runtime_data_bytes {
-                let runtime_data_str = std::str::from_utf8(bytes)
-                    .context("runtime_data is not a valid UTF-8 string")?;
+                let runtime_data_str = urlencoding::encode_binary(bytes);
                     
                 if !url.contains("runtime_data=") {
                     url.push_str("?runtime_data=");
                 } 
-                url.push_str(runtime_data_str);
+                url.push_str(&runtime_data_str);
             }
 
             let response = self.http_client
