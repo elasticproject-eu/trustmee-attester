@@ -1,4 +1,4 @@
-use attestation_input_format::{
+use trustmee_attester::{
     build_rest_attestation_body, build_trustmee_json_cmw, component_id_from_bytes, BuildInput,
     Endorsement, InitDataInput, RestRequestOptions, RuntimeData, CMW_INDICATOR_ENDORSEMENT,
     CMW_INDICATOR_EVIDENCE, TRUSTMEE_COLLECTION_TYPE, TRUSTMEE_EAT_PROFILE, WASM_MEDIA_TYPE,
@@ -343,7 +343,7 @@ fn vendored_sample_files_can_build_trustmee_cmw() {
 #[test]
 fn cli_can_generate_trustmee_output_from_vendored_sample_files() {
     let root = crate_root();
-    let output = Command::new(env!("CARGO_BIN_EXE_attestation-input-format"))
+    let output = Command::new(env!("CARGO_BIN_EXE_trustmee-attester"))
         .current_dir(&root)
         .args([
             "--mode",
@@ -355,7 +355,7 @@ fn cli_can_generate_trustmee_output_from_vendored_sample_files() {
             "--compact",
         ])
         .output()
-        .expect("run attestation-input-format binary");
+        .expect("run trustmee-attester binary");
 
     assert!(
         output.status.success(),

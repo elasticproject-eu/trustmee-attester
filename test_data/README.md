@@ -1,4 +1,4 @@
-Sample data for `attestation-input-format`.
+Sample data for `trustmee-attester`.
 
 Included files:
 - `snp_evidence.json`

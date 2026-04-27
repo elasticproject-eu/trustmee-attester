@@ -1,5 +1,5 @@
 [package]
-name = "attestation-input-format"
+name = "trustmee-attester"
 version = "0.1.0"
 edition = "2021"
 description = "Standalone builder for TrustMee CMW and attestation-service REST payloads"

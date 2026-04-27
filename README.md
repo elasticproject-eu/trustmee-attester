@@ -1,4 +1,4 @@
-# attestation-input-format
+# trustmee-attester
 
 Standalone Rust crate and CLI for turning raw attestation evidence into:
 
@@ -9,7 +9,7 @@ Standalone Rust crate and CLI for turning raw attestation evidence into:
 ## Library
 
 ```rust
-use attestation_input_format::{
+use trustmee_attester::{
     build_trustmee_json_cmw, BuildInput, Endorsement,
 };
 
@@ -45,7 +45,7 @@ let trustmee_evidence = trustmee_builder_client.build_trustmee_json_cmw_coco(Som
 Build TrustMee JSON CMW (trustmee-lib expected input):
 
 ```bash
-cd attestation-input-for-trustmee
+cd trustmee-attester
 cargo run -- \
   --mode trustmee \
   --evidence ./test_data/snp_evidence.json \
@@ -55,7 +55,7 @@ cargo run -- \
 Build a REST `/attestation` body for the Wasm-backed verifier flow (TrustMee expected input):
 
 ```bash
-cd attestation-input-for-trustmee
+cd trustmee-attester
 cargo run -- \
   --mode rest \
   --tee snp \

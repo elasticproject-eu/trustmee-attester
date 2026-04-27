@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use attestation_input_format::{
+use trustmee_attester::{
     build_rest_attestation_body, build_trustmee_json_cmw, BuildInput, Endorsement, InitDataInput,
     RestRequestOptions, RuntimeData,
 };
@@ -16,7 +16,7 @@ enum OutputMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "attestation-input-format")]
+#[command(name = "trustmee-attester")]
 #[command(about = "Build TrustMee CMW or attestation-service REST payloads from raw evidence")]
 struct Args {
     #[arg(long, value_enum)]
