@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use trustmee_attester::{
-    build_rest_attestation_body, build_trustmee_json_cmw, BuildInput, Endorsement, InitDataInput,
-    RestRequestOptions, RuntimeData,
+    build_kbs_auth_request, build_kbs_attest_request, build_rest_attestation_body,
+    build_trustmee_json_cmw, BuildInput, ComponentSource, Endorsement, InitDataInput,
+    KbsInitData, KbsRequestOptions, RestRequestOptions, RuntimeData,
 };
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
@@ -13,26 +14,35 @@ use std::path::{Path, PathBuf};
 enum OutputMode {
     Trustmee,
     Rest,
+    KbsAuth,
+    KbsAttest,
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "trustmee-attester")]
+#[command(name = "trustmee_attester")]
 #[command(about = "Build TrustMee CMW or attestation-service REST payloads from raw evidence")]
 struct Args {
     #[arg(long, value_enum)]
     mode: OutputMode,
 
+    /// Evidence file (required for trustmee, rest, kbs-attest).
     #[arg(long)]
-    evidence: PathBuf,
+    evidence: Option<PathBuf>,
 
     #[arg(long, default_value = "application/octet-stream")]
     evidence_media_type: String,
 
-    #[arg(long)]
+    /// Staple the component bytes in the output; component ID is derived via SHA-256.
+    #[arg(long, conflicts_with_all = ["component_id", "component_id_from"])]
     component: Option<PathBuf>,
 
-    #[arg(long)]
+    /// Pre-computed component ID (no bytes stapled in output).
+    #[arg(long, conflicts_with_all = ["component", "component_id_from"])]
     component_id: Option<String>,
+
+    /// Derive the component ID from the file's SHA-256 hash without stapling the bytes.
+    #[arg(long, conflicts_with_all = ["component", "component_id"])]
+    component_id_from: Option<PathBuf>,
 
     #[arg(long, value_name = "LABEL:MEDIA_TYPE:PATH")]
     endorsement: Vec<String>,
@@ -43,8 +53,7 @@ struct Args {
     #[arg(long)]
     output_file: Option<PathBuf>,
 
-    #[arg(long)]
-    tee: Option<String>,
+    // ── attestation-service REST options ──────────────────────────────────────
 
     #[arg(long = "policy-id")]
     policy_ids: Vec<String>,
@@ -61,27 +70,52 @@ struct Args {
     #[arg(long, conflicts_with = "init_data_digest")]
     init_data_toml: Option<PathBuf>,
 
-    #[arg(long, value_parser = ["sha256", "sha384", "sha512"])]
+    #[arg(long, value_parser = ["sha256"])]
     runtime_data_hash_algorithm: Option<String>,
+
+    // ── KBS-specific options ──────────────────────────────────────────────────
+
+    /// Nonce from the KBS challenge response (required for kbs-attest).
+    #[arg(long)]
+    nonce: Option<String>,
+
+    /// Path to a JSON file containing the JWK-formatted TEE public key (required for kbs-attest).
+    #[arg(long)]
+    tee_pubkey_json: Option<PathBuf>,
+
+    /// KBS init-data: a JSON file whose contents become the `body` (format = json).
+    #[arg(long, conflicts_with = "kbs_init_data_toml")]
+    kbs_init_data_json: Option<PathBuf>,
+
+    /// KBS init-data: a TOML file whose contents become the `body` (format = toml).
+    #[arg(long, conflicts_with = "kbs_init_data_json")]
+    kbs_init_data_toml: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let input = build_input(&args)?;
 
     match args.mode {
         OutputMode::Trustmee => {
+            let input = build_input(&args)?;
             let built = build_trustmee_json_cmw(&input)?;
-            write_json_output(
-                &built.cmw_json_value,
-                args.compact,
-                args.output_file.as_deref(),
-            )?;
+            write_json_output(&built.cmw_json_value, args.compact, args.output_file.as_deref())?;
         }
         OutputMode::Rest => {
-            let options = build_rest_options(&args)?;
+            let input = build_input(&args)?;
+            let options = build_rest_options(&args);
             let body = build_rest_attestation_body(&input, &options)?;
             write_json_output(&body, args.compact, args.output_file.as_deref())?;
+        }
+        OutputMode::KbsAuth => {
+            let auth = build_kbs_auth_request();
+            write_json_output(&auth, args.compact, args.output_file.as_deref())?;
+        }
+        OutputMode::KbsAttest => {
+            let input = build_input(&args)?;
+            let options = build_kbs_options(&args)?;
+            let attest = build_kbs_attest_request(&input, &options)?;
+            write_json_output(&attest, args.compact, args.output_file.as_deref())?;
         }
     }
 
@@ -89,13 +123,23 @@ fn main() -> Result<()> {
 }
 
 fn build_input(args: &Args) -> Result<BuildInput> {
-    let evidence = read_bytes(&args.evidence, "evidence")?;
+    let evidence_path = args
+        .evidence
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--evidence is required for this mode"))?;
+    let evidence = read_bytes(evidence_path, "evidence")?;
 
-    let component = args
-        .component
-        .as_deref()
-        .map(|path| read_bytes(path, "component"))
-        .transpose()?;
+    let component_source = match (&args.component, &args.component_id, &args.component_id_from) {
+        (Some(path), None, None) => ComponentSource::Bytes(read_bytes(path, "component")?),
+        (None, Some(id), None) => ComponentSource::Id(id.clone()),
+        (None, None, Some(path)) => {
+            ComponentSource::BytesForId(read_bytes(path, "component-id-from")?)
+        }
+        (None, None, None) => bail!(
+            "one of --component, --component-id, or --component-id-from must be provided"
+        ),
+        _ => bail!("--component, --component-id, and --component-id-from are mutually exclusive"),
+    };
 
     let endorsements = args
         .endorsement
@@ -106,45 +150,74 @@ fn build_input(args: &Args) -> Result<BuildInput> {
     Ok(BuildInput {
         evidence,
         evidence_media_type: args.evidence_media_type.clone(),
-        component,
-        component_id: args.component_id.clone(),
+        component_source,
         endorsements,
     })
 }
 
-fn build_rest_options(args: &Args) -> Result<RestRequestOptions> {
-    let tee = args
-        .tee
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("--tee is required when --mode rest is used"))?;
-
+fn build_rest_options(args: &Args) -> RestRequestOptions {
     let runtime_data = match (&args.runtime_data_raw, &args.runtime_data_json) {
-        (Some(path), None) => Some(RuntimeData::Raw(read_bytes(path, "runtime data raw")?)),
-        (None, Some(path)) => Some(RuntimeData::Structured(read_json(path)?)),
-        (None, None) => None,
-        (Some(_), Some(_)) => bail!("runtime data flags are mutually exclusive"),
+        (Some(path), None) => read_bytes(path, "runtime data raw")
+            .ok()
+            .map(RuntimeData::Raw),
+        (None, Some(path)) => read_json(path).ok().map(RuntimeData::Structured),
+        _ => None,
     };
 
     let init_data = match (&args.init_data_digest, &args.init_data_toml) {
-        (Some(path), None) => Some(InitDataInput::InitDataDigest(read_bytes(
-            path,
-            "init data digest",
-        )?)),
-        (None, Some(path)) => Some(InitDataInput::InitDataToml(read_string(
-            path,
-            "init data toml",
-        )?)),
-        (None, None) => None,
-        (Some(_), Some(_)) => bail!("init data flags are mutually exclusive"),
+        (Some(path), None) => read_bytes(path, "init data digest")
+            .ok()
+            .map(InitDataInput::InitDataDigest),
+        (None, Some(path)) => read_string(path, "init data toml")
+            .ok()
+            .map(InitDataInput::InitDataToml),
+        _ => None,
     };
 
-    Ok(RestRequestOptions {
-        tee,
-        policy_ids: args.policy_ids.clone(),
-        runtime_data,
-        init_data,
-        runtime_data_hash_algorithm: args.runtime_data_hash_algorithm.clone(),
-    })
+    let mut builder = RestRequestOptions::builder();
+    for id in &args.policy_ids {
+        builder = builder.policy_id(id.clone());
+    }
+    if let Some(data) = runtime_data {
+        builder = builder.runtime_data(data);
+    }
+    if let Some(data) = init_data {
+        builder = builder.init_data(data);
+    }
+    if let Some(algo) = &args.runtime_data_hash_algorithm {
+        builder = builder.runtime_data_hash_algorithm(algo.clone());
+    }
+    builder.build()
+}
+
+fn build_kbs_options(args: &Args) -> Result<KbsRequestOptions> {
+    let nonce = args
+        .nonce
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--nonce is required for --mode kbs-attest"))?;
+    let tee_pubkey = match &args.tee_pubkey_json {
+        Some(path) => read_json(path)?,
+        None => bail!("--tee-pubkey-json is required for --mode kbs-attest"),
+    };
+
+    let init_data = match (&args.kbs_init_data_json, &args.kbs_init_data_toml) {
+        (Some(path), None) => Some(KbsInitData {
+            format: "json".to_string(),
+            body: read_string(path, "KBS init data JSON")?,
+        }),
+        (None, Some(path)) => Some(KbsInitData {
+            format: "toml".to_string(),
+            body: read_string(path, "KBS init data TOML")?,
+        }),
+        (None, None) => None,
+        (Some(_), Some(_)) => bail!("KBS init data flags are mutually exclusive"),
+    };
+
+    let mut builder = KbsRequestOptions::builder(nonce, tee_pubkey);
+    if let Some(data) = init_data {
+        builder = builder.init_data(data);
+    }
+    Ok(builder.build())
 }
 
 fn parse_endorsement_arg(value: &str) -> Result<Endorsement> {
@@ -179,7 +252,7 @@ fn read_string(path: &Path, purpose: &str) -> Result<String> {
 }
 
 fn read_json(path: &Path) -> Result<Value> {
-    let bytes = read_bytes(path, "runtime data json")?;
+    let bytes = read_bytes(path, "JSON file")?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse JSON from {}", path.display()))
 }
 
