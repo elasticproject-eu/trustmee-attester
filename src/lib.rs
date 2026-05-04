@@ -17,7 +17,6 @@ const CMW_COLLECTION_TYPE_KEY: &str = "__cmwc_t";
 const EVIDENCE_LABEL: &str = "evidence";
 const VERIFIER_LABEL: &str = "verifier";
 const TRUSTMEE_EAT_JSON_MEDIA_TYPE: &str = "application/eat-ucs+json";
-const WASM_VERIFIER_NAME: &str = "wasm-verification-component";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuildInput {
@@ -103,7 +102,6 @@ pub struct RestAttestationBody {
 pub struct RestVerificationRequest {
     pub tee: String,
     pub evidence: String,
-    pub verifier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_data: Option<RuntimeData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,9 +188,8 @@ pub fn build_rest_attestation_body(
 
     let built = build_trustmee_json_cmw(input)?;
     let request = RestVerificationRequest {
-        tee: options.tee.clone(),
+        tee: "sample".to_string(),
         evidence: encode_base64url(&built.cmw_json_bytes),
-        verifier: WASM_VERIFIER_NAME.to_string(),
         runtime_data: options.runtime_data.clone(),
         init_data: options.init_data.clone(),
         runtime_data_hash_algorithm: options.runtime_data_hash_algorithm.clone(),

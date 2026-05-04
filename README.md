@@ -64,5 +64,7 @@ cargo run -- \
   --policy-id default
 ```
 
-Use `--output-file` to write the generated JSON to disk and `--compact` for one-line JSON.
+The generated REST request uses `tee: "sample"` to select Wasm verification;
+the verifier component reports the real TEE type in its output claims.
 
+Use `--output-file` to write the generated JSON to disk and `--compact` for one-line JSON.

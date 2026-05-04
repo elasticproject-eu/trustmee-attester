@@ -246,8 +246,7 @@ fn rest_body_wraps_cmw_and_defaults_policy_ids() {
     assert_eq!(rest.verification_requests.len(), 1);
 
     let request = &rest.verification_requests[0];
-    assert_eq!(request.tee, "snp");
-    assert_eq!(request.verifier, "wasm-verification-component");
+    assert_eq!(request.tee, "sample");
     assert_eq!(
         request.evidence,
         URL_SAFE_NO_PAD.encode(&trustmee.cmw_json_bytes)
