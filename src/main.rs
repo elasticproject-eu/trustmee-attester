@@ -1,8 +1,12 @@
 use anyhow::{bail, Context, Result};
 use trustmee_attester::{
     build_kbs_auth_request, build_kbs_attest_request, build_rest_attestation_body,
-    build_trustmee_json_cmw, BuildInput, ComponentSource, Endorsement, InitDataInput,
-    KbsInitData, KbsRequestOptions, RestRequestOptions, RuntimeData,
+    build_trustmee_json_cmw,
+    collateral::{
+        CollateralSource, SgxCollateralOptions, SnpCollateralOptions, TdxCollateralOptions,
+    },
+    fetch_collateral, BuildInput, ComponentSource, Endorsement, InitDataInput, KbsInitData,
+    KbsRequestOptions, RestRequestOptions, RuntimeData,
 };
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
@@ -16,6 +20,14 @@ enum OutputMode {
     Rest,
     KbsAuth,
     KbsAttest,
+}
+
+/// TEE type for `--fetch-collateral`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TeeKind {
+    Snp,
+    Tdx,
+    Sgx,
 }
 
 #[derive(Debug, Parser)]
@@ -46,6 +58,21 @@ struct Args {
 
     #[arg(long, value_name = "LABEL:MEDIA_TYPE:PATH")]
     endorsement: Vec<String>,
+
+    /// Fetch collateral (certificates + TCB metadata) for the given TEE type
+    /// and attach it as endorsements inside the CMW.  Requires network access
+    /// to AMD KDS (SNP) or Intel PCS (TDX/SGX).
+    #[arg(long, value_enum)]
+    fetch_collateral: Option<TeeKind>,
+
+    /// Override the AMD KDS base URL used when --fetch-collateral snp is set.
+    #[arg(long, default_value = attestation_input_format::collateral::AMD_KDS_BASE_URL)]
+    kds_url: String,
+
+    /// Override the SNP product name sent to AMD KDS (e.g. "Milan", "Genoa").
+    /// Auto-detected from the evidence CPUID fields when not specified.
+    #[arg(long)]
+    snp_product: Option<String>,
 
     #[arg(long)]
     compact: bool,
@@ -141,11 +168,18 @@ fn build_input(args: &Args) -> Result<BuildInput> {
         _ => bail!("--component, --component-id, and --component-id-from are mutually exclusive"),
     };
 
-    let endorsements = args
+    let mut endorsements = args
         .endorsement
         .iter()
         .map(|value| parse_endorsement_arg(value))
         .collect::<Result<Vec<_>>>()?;
+
+    if let Some(tee) = args.fetch_collateral {
+        let source = collateral_source(tee, args);
+        let fetched = fetch_collateral(&evidence, &source)
+            .context("fetch collateral")?;
+        endorsements.extend(fetched);
+    }
 
     Ok(BuildInput {
         evidence,
@@ -153,6 +187,17 @@ fn build_input(args: &Args) -> Result<BuildInput> {
         component_source,
         endorsements,
     })
+}
+
+fn collateral_source(tee: TeeKind, args: &Args) -> CollateralSource {
+    match tee {
+        TeeKind::Snp => CollateralSource::Snp(SnpCollateralOptions {
+            kds_base_url: args.kds_url.clone(),
+            product_name: args.snp_product.clone(),
+        }),
+        TeeKind::Tdx => CollateralSource::Tdx(TdxCollateralOptions),
+        TeeKind::Sgx => CollateralSource::Sgx(SgxCollateralOptions),
+    }
 }
 
 fn build_rest_options(args: &Args) -> RestRequestOptions {

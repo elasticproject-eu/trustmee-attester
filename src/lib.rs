@@ -1,3 +1,9 @@
+pub mod collateral;
+pub use collateral::{
+    CollateralSource, SgxCollateralOptions, SnpCollateralOptions, TdxCollateralOptions,
+    fetch_collateral,
+};
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
