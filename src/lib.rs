@@ -602,13 +602,50 @@ pub mod trustmee_coco_client {
     use reqwest::Client;
     use std::time::Duration;
 
-    use crate::{BuildInput, BuiltTrustMeeInput, Endorsement, build_trustmee_json_cmw};
+    use crate::{BuildInput, BuiltTrustMeeInput, ComponentSource, Endorsement, build_trustmee_json_cmw};
 
-    const DEFAULT_COCO_EVIDENCE_URL: &str = "http://127.0.0.1:8006/aa/evidence";
-    const DUMMY_COMPONENT_ID: &str = "component-0000000000000000000000000000000000000000000000000000000000000000";
+    pub const DEFAULT_COCO_EVIDENCE_URL: &str = "http://127.0.0.1:8006/aa/evidence";
 
     // -------------------------------------------------------------------------
-    // 1. The Builder
+    // Synchronous helper — for use in blocking contexts (e.g. the CLI binary).
+    // Uses reqwest::blocking so no async runtime is required.
+    // -------------------------------------------------------------------------
+
+    /// Fetch raw evidence bytes from the Attestation Agent over blocking HTTP.
+    ///
+    /// `runtime_data` is appended to the request URL exactly as a UTF-8 string,
+    /// which is the format the CoCo AA / TDX hardware expects.
+    pub fn fetch_evidence_from_aa(url: &str, runtime_data: Option<&[u8]>) -> Result<Vec<u8>> {
+        let mut request_url = url.to_string();
+        if let Some(bytes) = runtime_data {
+            let s = std::str::from_utf8(bytes)
+                .context("runtime_data is not valid UTF-8")?;
+            if request_url.contains('?') {
+                request_url.push_str("&runtime_data=");
+            } else {
+                request_url.push_str("?runtime_data=");
+            }
+            request_url.push_str(s);
+        }
+
+        let resp = reqwest::blocking::get(&request_url)
+            .context("failed to connect to Attestation Agent")?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "AA returned error {}: {}",
+                resp.status(),
+                resp.text().unwrap_or_default()
+            );
+        }
+
+        resp.bytes()
+            .context("failed to read evidence bytes from AA")
+            .map(|b| b.to_vec())
+    }
+
+    // -------------------------------------------------------------------------
+    // Async client — for use as a library crate in async applications.
     // -------------------------------------------------------------------------
 
     pub struct CocoClientBuilder {
@@ -624,19 +661,19 @@ pub mod trustmee_coco_client {
             }
         }
 
-        /// Overrides the default Attestation Agent URL
+        /// Override the default Attestation Agent URL.
         pub fn url(mut self, url: impl Into<String>) -> Self {
             self.url = url.into();
             self
         }
 
-        /// Overrides the default HTTP request timeout
+        /// Override the default HTTP request timeout.
         pub fn timeout(mut self, timeout: Duration) -> Self {
             self.timeout = timeout;
             self
         }
 
-        /// Builds and returns the stateful CocoClient, initializing the connection pool
+        /// Build the [`CocoClient`], initialising the underlying connection pool.
         pub fn build(self) -> Result<CocoClient> {
             let http_client = Client::builder()
                 .timeout(self.timeout)
@@ -650,46 +687,47 @@ pub mod trustmee_coco_client {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // 2. The Stateful Client
-    // -------------------------------------------------------------------------
-
     #[derive(Clone)]
     pub struct CocoClient {
-        http_client: Client, // Automatically shares the internal connection pool when cloned
+        http_client: Client, // cloning shares the internal connection pool
         aa_url: String,
     }
 
     impl CocoClient {
-        /// Starts the builder pattern
         pub fn builder() -> CocoClientBuilder {
             CocoClientBuilder::new()
         }
 
-        /// The underlying method to fetch raw evidence bytes
-        async fn fetch_evidence(&self, runtime_data_bytes: Option<&[u8]>) -> Result<Vec<u8>> {
+        /// Fetch raw evidence bytes from the Attestation Agent.
+        ///
+        /// `runtime_data` is appended to the request URL as a UTF-8 string,
+        /// which is the format the CoCo AA / TDX hardware expects.
+        pub async fn fetch_evidence_bytes(
+            &self,
+            runtime_data: Option<&[u8]>,
+        ) -> Result<Vec<u8>> {
             let mut url = self.aa_url.clone();
-            
-            // Append the runtime data exactly as a UTF-8 string to satisfy the AA/TDX hardware
-            if let Some(bytes) = runtime_data_bytes {
-                let runtime_data_str = std::str::from_utf8(bytes)
-                    .context("runtime_data is not a valid UTF-8 string")?;
-                    
-                if !url.contains("runtime_data=") {
+            if let Some(bytes) = runtime_data {
+                let s = std::str::from_utf8(bytes)
+                    .context("runtime_data is not valid UTF-8")?;
+                if url.contains('?') {
+                    url.push_str("&runtime_data=");
+                } else {
                     url.push_str("?runtime_data=");
-                } 
-                url.push_str(runtime_data_str);
+                }
+                url.push_str(s);
             }
 
-            let response = self.http_client
+            let response = self
+                .http_client
                 .get(&url)
                 .send()
                 .await
-                .context("failed to send async request to CoCo API")?;
+                .context("failed to send request to Attestation Agent")?;
 
             if !response.status().is_success() {
                 anyhow::bail!(
-                    "AA API returned error status: {} - {}",
+                    "AA returned error {}: {}",
                     response.status(),
                     response.text().await.unwrap_or_default()
                 );
@@ -698,38 +736,66 @@ pub mod trustmee_coco_client {
             response
                 .bytes()
                 .await
-                .context("failed to read CoCo API response bytes")
+                .context("failed to read evidence bytes from AA")
                 .map(|b| b.to_vec())
         }
 
-        /// Fetches the evidence and formats it into the TrustMee CMW JSON structure
+        /// Fetch evidence from the AA and build a TrustMee CMW JSON structure.
+        ///
+        /// Behaviour is identical to the CLI pipeline with `--evidence`: once
+        /// the evidence bytes are in hand, CMW assembly is the same regardless
+        /// of how they were obtained.  Pass pre-fetched collateral via
+        /// `endorsements`, or use [`build_trustmee_json_cmw_coco_with_collateral`]
+        /// (available when the `fetch-collateral` feature is also enabled) to
+        /// have collateral fetched automatically.
         pub async fn build_trustmee_json_cmw_coco(
-                    &self,
-                    runtime_data: Option<&[u8]>,
-                    verifier_component_id: Option<String>,
-                    verifier_component: Option<Vec<u8>>,
-                    evidence_media_type: Option<String>,
-                    endorsements: Option<Vec<Endorsement>>,
-                ) -> Result<BuiltTrustMeeInput> {
-                    // 1. Fetch the hardware evidence
-                    let evidence = self.fetch_evidence(runtime_data).await?;
+            &self,
+            runtime_data: Option<&[u8]>,
+            component_source: ComponentSource,
+            evidence_media_type: Option<String>,
+            endorsements: Option<Vec<Endorsement>>,
+        ) -> Result<BuiltTrustMeeInput> {
+            let evidence = self.fetch_evidence_bytes(runtime_data).await?;
+            let media_type =
+                evidence_media_type.unwrap_or_else(|| "application/octet-stream".into());
+            let input = BuildInput {
+                evidence,
+                evidence_media_type: media_type,
+                component_source,
+                endorsements: endorsements.unwrap_or_default(),
+            };
+            Ok(build_trustmee_json_cmw(&input)?)
+        }
+    }
 
-                    let media_type = evidence_media_type.unwrap_or_else(|| "application/octet-stream".into());
-
-                    let component_id =
-                        verifier_component_id.or_else(|| Some(DUMMY_COMPONENT_ID.into()));
-
-                    // 2. Construct the BildInput
-                    let input = BuildInput {
-                        evidence,
-                        evidence_media_type: media_type,
-                        component: verifier_component,
-                        component_id,
-                        endorsements: endorsements.unwrap_or_default(),
-                    };
-
-                    // 3. Pass both the input and the build options to the core CMW builder
-                    build_trustmee_json_cmw(&input)
+    /// Extra methods available only when both `confidential-containers` and
+    /// `fetch-collateral` features are enabled together.
+    #[cfg(feature = "fetch-collateral")]
+    impl CocoClient {
+        /// Like [`build_trustmee_json_cmw_coco`] but also fetches collateral
+        /// (certificates + TCB metadata) from the appropriate TEE vendor service
+        /// and attaches it as endorsements before building the CMW.
+        pub async fn build_trustmee_json_cmw_coco_with_collateral(
+            &self,
+            runtime_data: Option<&[u8]>,
+            component_source: ComponentSource,
+            evidence_media_type: Option<String>,
+            endorsements: Option<Vec<Endorsement>>,
+            collateral_source: &crate::CollateralSource,
+        ) -> Result<BuiltTrustMeeInput> {
+            let evidence = self.fetch_evidence_bytes(runtime_data).await?;
+            let media_type =
+                evidence_media_type.unwrap_or_else(|| "application/octet-stream".into());
+            let mut all_endorsements = endorsements.unwrap_or_default();
+            let fetched = crate::fetch_collateral(&evidence, collateral_source)?;
+            all_endorsements.extend(fetched);
+            let input = BuildInput {
+                evidence,
+                evidence_media_type: media_type,
+                component_source,
+                endorsements: all_endorsements,
+            };
+            Ok(build_trustmee_json_cmw(&input)?)
         }
     }
 }

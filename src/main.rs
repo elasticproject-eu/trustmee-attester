@@ -8,6 +8,8 @@ use trustmee_attester::{
     fetch_collateral, BuildInput, ComponentSource, Endorsement, InitDataInput, KbsInitData,
     KbsRequestOptions, RestRequestOptions, RuntimeData,
 };
+#[cfg(feature = "confidential-containers")]
+use trustmee_attester::trustmee_coco_client::fetch_evidence_from_aa;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use serde_json::Value;
@@ -66,7 +68,7 @@ struct Args {
     fetch_collateral: Option<TeeKind>,
 
     /// Override the AMD KDS base URL used when --fetch-collateral snp is set.
-    #[arg(long, default_value = attestation_input_format::collateral::AMD_KDS_BASE_URL)]
+    #[arg(long, default_value = trustmee_attester::collateral::AMD_KDS_BASE_URL)]
     kds_url: String,
 
     /// Override the SNP product name sent to AMD KDS (e.g. "Milan", "Genoa").
@@ -117,6 +119,29 @@ struct Args {
     /// KBS init-data: a TOML file whose contents become the `body` (format = toml).
     #[arg(long, conflicts_with = "kbs_init_data_json")]
     kbs_init_data_toml: Option<PathBuf>,
+
+    // ── Confidential Containers Attestation Agent ─────────────────────────────
+
+    /// Fetch evidence from the Confidential Containers Attestation Agent
+    /// instead of reading it from --evidence.
+    #[cfg(feature = "confidential-containers")]
+    #[arg(long, conflicts_with = "evidence")]
+    fetch_from_aa: bool,
+
+    /// Attestation Agent endpoint URL.
+    #[cfg(feature = "confidential-containers")]
+    #[arg(
+        long,
+        default_value = trustmee_attester::trustmee_coco_client::DEFAULT_COCO_EVIDENCE_URL,
+        requires = "fetch_from_aa"
+    )]
+    aa_url: String,
+
+    /// Write the raw evidence bytes fetched from the AA to this file.
+    /// Useful for debugging or caching evidence for later use with --evidence.
+    #[cfg(feature = "confidential-containers")]
+    #[arg(long, requires = "fetch_from_aa")]
+    save_evidence: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -149,12 +174,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_input(args: &Args) -> Result<BuildInput> {
+fn get_evidence(args: &Args) -> Result<Vec<u8>> {
+    #[cfg(feature = "confidential-containers")]
+    if args.fetch_from_aa {
+        // runtime_data_raw is reused as the nonce/runtime-data sent to the AA.
+        let runtime_data = args
+            .runtime_data_raw
+            .as_ref()
+            .map(|p| read_bytes(p, "runtime data for AA"))
+            .transpose()?;
+        let evidence = fetch_evidence_from_aa(&args.aa_url, runtime_data.as_deref())
+            .context("fetch evidence from Attestation Agent")?;
+        if let Some(path) = &args.save_evidence {
+            fs::write(path, &evidence)
+                .with_context(|| format!("save evidence to {}", path.display()))?;
+        }
+        return Ok(evidence);
+    }
+
     let evidence_path = args
         .evidence
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("--evidence is required for this mode"))?;
-    let evidence = read_bytes(evidence_path, "evidence")?;
+    read_bytes(evidence_path, "evidence")
+}
+
+fn build_input(args: &Args) -> Result<BuildInput> {
+    let evidence = get_evidence(args)?;
 
     let component_source = match (&args.component, &args.component_id, &args.component_id_from) {
         (Some(path), None, None) => ComponentSource::Bytes(read_bytes(path, "component")?),
