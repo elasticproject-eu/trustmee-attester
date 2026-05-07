@@ -680,7 +680,7 @@ pub mod trustmee_coco_client {
             } else {
                 request_url.push_str("?runtime_data=");
             }
-            request_url.push_str(s);
+            request_url.push_str(&urlencoding::encode(s));
         }
 
         let resp = reqwest::blocking::get(&request_url)
@@ -1059,7 +1059,7 @@ pub mod trustmee_coco_client {
                 } else {
                     url.push_str("?runtime_data=");
                 }
-                url.push_str(s);
+                url.push_str(&urlencoding::encode(s));
             }
 
             let response = self

@@ -28,3 +28,4 @@ sev = { git = "https://github.com/virtee/sev", rev = "d487809188c3c92e397bc92e2c
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+urlencoding = "2"
