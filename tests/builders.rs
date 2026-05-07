@@ -1,14 +1,24 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{fs, path::PathBuf, process::Command};
+#[cfg(feature = "confidential-containers")]
+use trustmee_attester::trustmee_coco_client::{CocoBuildOptions, CocoClient, IntoCocoBuildOptions};
+#[cfg(all(feature = "confidential-containers", feature = "fetch-collateral"))]
+use trustmee_attester::trustmee_coco_client::{
+    CocoBuildWithCollateralOptions, IntoCocoBuildWithCollateralOptions,
+};
+#[cfg(all(feature = "confidential-containers", feature = "fetch-collateral"))]
+use trustmee_attester::CollateralSource;
 use trustmee_attester::{
-    build_kbs_auth_request, build_kbs_attest_request, build_rest_attestation_body,
+    build_kbs_attest_request, build_kbs_auth_request, build_rest_attestation_body,
     build_trustmee_json_cmw, component_id_from_bytes, BuildInput, Endorsement, Error,
     InitDataInput, KbsInitData, KbsRequestOptions, RestRequestOptions, RuntimeData,
     CMW_INDICATOR_ENDORSEMENT, CMW_INDICATOR_EVIDENCE, TRUSTMEE_COLLECTION_TYPE,
     TRUSTMEE_EAT_PROFILE, WASM_MEDIA_TYPE,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::{fs, path::PathBuf, process::Command};
+#[cfg(feature = "confidential-containers")]
+use trustmee_attester::{ComponentSource, DEFAULT_EVIDENCE_MEDIA_TYPE};
 
 #[test]
 fn component_id_from_bytes_uses_sha256_prefix_format() {
@@ -111,6 +121,25 @@ fn trustmee_json_cmw_contains_expected_records_and_encodings() {
 }
 
 #[test]
+fn build_input_new_derives_component_id_from_component_bytes() {
+    let component = b"\0asmcomponent".to_vec();
+    let input = BuildInput::new(b"sample evidence".to_vec(), component.clone());
+
+    let built = build_trustmee_json_cmw(&input).expect("build trustmee json cmw");
+
+    assert_eq!(built.component_id, component_id_from_bytes(&component));
+    assert!(
+        built
+            .cmw_json_value
+            .as_object()
+            .expect("cmw object")
+            .get("verifier")
+            .is_some(),
+        "component bytes should be stapled when BuildInput::new is used"
+    );
+}
+
+#[test]
 fn trustmee_json_cmw_supports_component_id_only_mode() {
     let component_id = component_id_from_bytes(b"\0asmunstapled");
     let built = build_trustmee_json_cmw(
@@ -186,6 +215,48 @@ fn malformed_component_id_is_rejected() {
 }
 
 #[test]
+fn component_id_accepts_oci_url_form() {
+    let url = "oci://registry.example.com/trustmee/verifier-components:1.2.3";
+    let built = build_trustmee_json_cmw(
+        &BuildInput::builder(b"evidence")
+            .component_oci_url(url)
+            .build()
+            .expect("construct BuildInput"),
+    )
+    .expect("OCI URL component_id should be accepted");
+
+    assert_eq!(built.component_id, url);
+    let cmw = built.cmw_json_value.as_object().expect("cmw object");
+    assert!(
+        cmw.get("verifier").is_none(),
+        "OCI URL component_id should never staple bytes"
+    );
+
+    let evidence_record = cmw
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence record");
+    let eat_bytes = URL_SAFE_NO_PAD
+        .decode(evidence_record[1].as_str().expect("eat payload"))
+        .expect("decode eat payload");
+    let eat: Value = serde_json::from_slice(&eat_bytes).expect("parse eat json");
+    assert_eq!(eat["component_id"], url);
+}
+
+#[test]
+fn component_id_rejects_unknown_scheme() {
+    let err = build_trustmee_json_cmw(
+        &BuildInput::builder(b"evidence")
+            .component_id("ftp://example.com/x/y")
+            .build()
+            .expect("construct BuildInput"),
+    )
+    .expect_err("unknown scheme should fail");
+
+    assert!(matches!(err, Error::MalformedComponentId));
+}
+
+#[test]
 fn duplicate_endorsement_labels_are_rejected() {
     let err = build_trustmee_json_cmw(
         &BuildInput::builder(b"evidence")
@@ -218,7 +289,11 @@ fn reserved_labels_are_rejected() {
 fn rest_body_wraps_cmw_and_defaults_policy_ids() {
     let input = BuildInput::builder(b"evidence")
         .component(b"\0asmcomponent")
-        .endorsement(Endorsement::new("collateral", "application/test", vec![1, 2, 3]))
+        .endorsement(Endorsement::new(
+            "collateral",
+            "application/test",
+            vec![1, 2, 3],
+        ))
         .build()
         .expect("construct BuildInput");
 
@@ -246,6 +321,112 @@ fn rest_request_options_default_has_default_policy_id() {
     assert!(options.runtime_data_hash_algorithm.is_none());
 }
 
+#[cfg(feature = "confidential-containers")]
+#[test]
+fn coco_build_options_builder_defaults_optional_fields() {
+    let component_id = component_id_from_bytes(b"\0asmcomponent");
+    let options = CocoBuildOptions::new()
+        .component_id(component_id.clone())
+        .build()
+        .expect("build CoCo options");
+
+    assert!(options.runtime_data.is_none());
+    assert_eq!(options.evidence_media_type, DEFAULT_EVIDENCE_MEDIA_TYPE);
+    assert!(options.endorsements.is_empty());
+    assert_eq!(options.component_source, ComponentSource::Id(component_id));
+}
+
+#[cfg(feature = "confidential-containers")]
+#[test]
+fn coco_build_options_builder_accepts_only_changed_fields() {
+    fn accepts_coco_options(_: impl IntoCocoBuildOptions) {}
+
+    accepts_coco_options(
+        CocoBuildOptions::builder()
+            .runtime_data("nonce")
+            .component_id_from_bytes(b"\0asmcomponent"),
+    );
+
+    let options = CocoBuildOptions::new()
+        .runtime_data("first")
+        .no_runtime_data()
+        .evidence_media_type("application/vnd.example.evidence")
+        .component(b"\0asmcomponent")
+        .endorsement(Endorsement::new("extra", "application/test", vec![1]))
+        .build()
+        .expect("build CoCo options");
+
+    assert!(options.runtime_data.is_none());
+    assert_eq!(
+        options.evidence_media_type,
+        "application/vnd.example.evidence"
+    );
+    assert_eq!(options.endorsements.len(), 1);
+}
+
+#[cfg(feature = "confidential-containers")]
+#[test]
+fn coco_build_options_requires_component_source() {
+    let err = CocoBuildOptions::new()
+        .build()
+        .expect_err("missing component source should fail");
+
+    assert!(matches!(
+        err.downcast_ref::<Error>(),
+        Some(Error::MissingComponentSource)
+    ));
+}
+
+#[cfg(feature = "confidential-containers")]
+#[test]
+fn coco_client_builder_has_default_configuration() {
+    CocoClient::builder()
+        .build()
+        .expect("default CoCo client should build");
+}
+
+#[cfg(all(feature = "confidential-containers", feature = "fetch-collateral"))]
+#[test]
+fn coco_with_collateral_builder_defaults_and_requires_collateral_source() {
+    fn accepts_coco_collateral_options(_: impl IntoCocoBuildWithCollateralOptions) {}
+
+    let component_id = component_id_from_bytes(b"\0asmcomponent");
+
+    accepts_coco_collateral_options(
+        CocoBuildWithCollateralOptions::new()
+            .component_id(component_id.clone())
+            .snp_collateral(),
+    );
+
+    let options = CocoBuildWithCollateralOptions::builder()
+        .component_id(component_id.clone())
+        .sgx_collateral()
+        .build()
+        .expect("build CoCo collateral options");
+
+    assert_eq!(
+        options.build_options.component_source,
+        ComponentSource::Id(component_id)
+    );
+    assert_eq!(
+        options.build_options.evidence_media_type,
+        DEFAULT_EVIDENCE_MEDIA_TYPE
+    );
+    assert!(matches!(
+        options.collateral_source,
+        CollateralSource::Sgx(_)
+    ));
+
+    let err = CocoBuildWithCollateralOptions::new()
+        .component_id_from_bytes(b"\0asmcomponent")
+        .build()
+        .expect_err("missing collateral source should fail");
+    assert!(matches!(
+        err.downcast_ref::<Error>(),
+        Some(Error::MissingCollateralSource)
+    ));
+}
+
 #[test]
 fn rest_options_builder_policy_ids_replace() {
     let options = RestRequestOptions::builder()
@@ -268,7 +449,9 @@ fn runtime_data_and_init_data_serialize_in_rest_shape() {
         &RestRequestOptions::builder()
             .policy_id("custom")
             .runtime_data(RuntimeData::Raw(b"runtime-data".to_vec()))
-            .init_data(InitDataInput::InitDataToml("algorithm = \"sha256\"".to_string()))
+            .init_data(InitDataInput::InitDataToml(
+                "algorithm = \"sha256\"".to_string(),
+            ))
             .runtime_data_hash_algorithm("sha256")
             .build(),
     )
@@ -339,6 +522,8 @@ fn vendored_sample_files_can_build_trustmee_cmw() {
 #[test]
 fn cli_can_generate_trustmee_output_from_vendored_sample_files() {
     let root = crate_root();
+    let component = fs::read(root.join("test_data/snp_verifier_component.wasm"))
+        .expect("read sample component");
     let output = Command::new(env!("CARGO_BIN_EXE_trustmee-attester"))
         .current_dir(&root)
         .args([
@@ -365,6 +550,16 @@ fn cli_can_generate_trustmee_output_from_vendored_sample_files() {
         stdout.get("verifier").is_some(),
         "CLI output should staple component"
     );
+
+    let evidence_record = stdout
+        .get("evidence")
+        .and_then(Value::as_array)
+        .expect("evidence record");
+    let eat_bytes = URL_SAFE_NO_PAD
+        .decode(evidence_record[1].as_str().expect("eat payload"))
+        .expect("decode eat payload");
+    let eat: Value = serde_json::from_slice(&eat_bytes).expect("parse eat json");
+    assert_eq!(eat["component_id"], component_id_from_bytes(&component));
 }
 
 // ── KBS tests ─────────────────────────────────────────────────────────────────
@@ -383,7 +578,10 @@ fn kbs_auth_request_has_correct_shape() {
     assert_eq!(auth.tee, "sample");
 
     let as_json = serde_json::to_value(&auth).expect("serialize auth request");
-    assert!(as_json.get("extra-params").is_some(), "extra-params field must be present");
+    assert!(
+        as_json.get("extra-params").is_some(),
+        "extra-params field must be present"
+    );
 }
 
 #[test]
@@ -407,7 +605,10 @@ fn kbs_attest_request_places_cmw_as_primary_evidence() {
     // Top-level fields use kebab-case
     assert!(as_json.get("runtime-data").is_some());
     assert!(as_json.get("tee-evidence").is_some());
-    assert!(as_json.get("init-data").is_none(), "init-data must be absent when not set");
+    assert!(
+        as_json.get("init-data").is_none(),
+        "init-data must be absent when not set"
+    );
 
     // runtime-data
     assert_eq!(as_json["runtime-data"]["nonce"], "test-nonce-abc");
@@ -416,7 +617,10 @@ fn kbs_attest_request_places_cmw_as_primary_evidence() {
     // primary_evidence is the raw CMW JSON value (not base64)
     let primary = &as_json["tee-evidence"]["primary_evidence"];
     assert_eq!(primary["__cmwc_t"], TRUSTMEE_COLLECTION_TYPE);
-    assert!(primary.get("verifier").is_some(), "CMW should be stapled in primary_evidence");
+    assert!(
+        primary.get("verifier").is_some(),
+        "CMW should be stapled in primary_evidence"
+    );
 
     // additional_evidence is an empty string for simple guests
     assert_eq!(as_json["tee-evidence"]["additional_evidence"], "");
@@ -511,5 +715,8 @@ fn cli_kbs_attest_produces_correct_output() {
 
     let stdout: Value = serde_json::from_slice(&output.stdout).expect("parse CLI JSON output");
     assert_eq!(stdout["runtime-data"]["nonce"], "test-cli-nonce");
-    assert_eq!(stdout["tee-evidence"]["primary_evidence"]["__cmwc_t"], TRUSTMEE_COLLECTION_TYPE);
+    assert_eq!(
+        stdout["tee-evidence"]["primary_evidence"]["__cmwc_t"],
+        TRUSTMEE_COLLECTION_TYPE
+    );
 }

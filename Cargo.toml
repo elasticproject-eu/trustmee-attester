@@ -8,7 +8,7 @@ readme = "README.md"
 
 [features]
 default = ["fetch-collateral"]
-fetch-collateral = ["dep:reqwest"]
+fetch-collateral = ["dep:ciborium", "dep:dcap-qvl", "dep:reqwest", "dep:sev", "dep:tokio"]
 # Enables the CocoClient (async) and fetch_evidence_from_aa (sync) helpers for
 # fetching evidence from the Confidential Containers Attestation Agent.
 confidential-containers = ["dep:reqwest"]
@@ -16,11 +16,15 @@ confidential-containers = ["dep:reqwest"]
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22.1"
+ciborium = { version = "0.2.2", optional = true }
 clap = { version = "4", features = ["derive"] }
+dcap-qvl = { version = "0.3.6", default-features = false, features = ["std", "rustcrypto", "report"], optional = true }
 hex = "0.4.3"
 reqwest = { version = "0.12", features = ["blocking"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
+sev = { git = "https://github.com/virtee/sev", rev = "d487809188c3c92e397bc92e2cb2a85eb982c980", default-features = false, features = ["openssl", "snp", "serde"], optional = true }
 sha2 = "0.10"
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

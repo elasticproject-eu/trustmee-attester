@@ -1,20 +1,20 @@
 use anyhow::{bail, Context, Result};
-use trustmee_attester::{
-    build_kbs_auth_request, build_kbs_attest_request, build_rest_attestation_body,
-    build_trustmee_json_cmw,
-    collateral::{
-        CollateralSource, SgxCollateralOptions, SnpCollateralOptions, TdxCollateralOptions,
-    },
-    fetch_collateral, BuildInput, ComponentSource, Endorsement, InitDataInput, KbsInitData,
-    KbsRequestOptions, RestRequestOptions, RuntimeData,
-};
-#[cfg(feature = "confidential-containers")]
-use trustmee_attester::trustmee_coco_client::fetch_evidence_from_aa;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "confidential-containers")]
+use trustmee_attester::trustmee_coco_client::fetch_evidence_from_aa;
+use trustmee_attester::{
+    build_kbs_attest_request, build_kbs_auth_request, build_rest_attestation_body,
+    build_trustmee_json_cmw,
+    collateral::{
+        CollateralSource, SgxCollateralOptions, SnpCollateralOptions, TdxCollateralOptions,
+    },
+    fetch_collateral, BuildInput, Endorsement, InitDataInput, KbsInitData, KbsRequestOptions,
+    RestRequestOptions, RuntimeData,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputMode {
@@ -76,6 +76,18 @@ struct Args {
     #[arg(long)]
     snp_product: Option<String>,
 
+    /// PCS/PCCS base URL used when --fetch-collateral tdx is set.
+    /// Defaults to Intel PCS.
+    #[arg(long, default_value = trustmee_attester::collateral::INTEL_PCS_TDX_BASE_URL)]
+    tdx_pccs_url: String,
+
+    /// PCS/PCCS base URL used when --fetch-collateral sgx is set.
+    /// Defaults to Phala PCCS, which serves the `pckcert` endpoint without an
+    /// Intel subscription key (required for quotes whose certification data
+    /// holds an encrypted PPID instead of an inline PCK chain).
+    #[arg(long, default_value = trustmee_attester::collateral::PHALA_PCCS_BASE_URL)]
+    sgx_pccs_url: String,
+
     #[arg(long)]
     compact: bool,
 
@@ -83,7 +95,6 @@ struct Args {
     output_file: Option<PathBuf>,
 
     // ── attestation-service REST options ──────────────────────────────────────
-
     #[arg(long = "policy-id")]
     policy_ids: Vec<String>,
 
@@ -103,7 +114,6 @@ struct Args {
     runtime_data_hash_algorithm: Option<String>,
 
     // ── KBS-specific options ──────────────────────────────────────────────────
-
     /// Nonce from the KBS challenge response (required for kbs-attest).
     #[arg(long)]
     nonce: Option<String>,
@@ -121,7 +131,6 @@ struct Args {
     kbs_init_data_toml: Option<PathBuf>,
 
     // ── Confidential Containers Attestation Agent ─────────────────────────────
-
     /// Fetch evidence from the Confidential Containers Attestation Agent
     /// instead of reading it from --evidence.
     #[cfg(feature = "confidential-containers")]
@@ -151,7 +160,11 @@ fn main() -> Result<()> {
         OutputMode::Trustmee => {
             let input = build_input(&args)?;
             let built = build_trustmee_json_cmw(&input)?;
-            write_json_output(&built.cmw_json_value, args.compact, args.output_file.as_deref())?;
+            write_json_output(
+                &built.cmw_json_value,
+                args.compact,
+                args.output_file.as_deref(),
+            )?;
         }
         OutputMode::Rest => {
             let input = build_input(&args)?;
@@ -202,18 +215,6 @@ fn get_evidence(args: &Args) -> Result<Vec<u8>> {
 fn build_input(args: &Args) -> Result<BuildInput> {
     let evidence = get_evidence(args)?;
 
-    let component_source = match (&args.component, &args.component_id, &args.component_id_from) {
-        (Some(path), None, None) => ComponentSource::Bytes(read_bytes(path, "component")?),
-        (None, Some(id), None) => ComponentSource::Id(id.clone()),
-        (None, None, Some(path)) => {
-            ComponentSource::BytesForId(read_bytes(path, "component-id-from")?)
-        }
-        (None, None, None) => bail!(
-            "one of --component, --component-id, or --component-id-from must be provided"
-        ),
-        _ => bail!("--component, --component-id, and --component-id-from are mutually exclusive"),
-    };
-
     let mut endorsements = args
         .endorsement
         .iter()
@@ -222,17 +223,29 @@ fn build_input(args: &Args) -> Result<BuildInput> {
 
     if let Some(tee) = args.fetch_collateral {
         let source = collateral_source(tee, args);
-        let fetched = fetch_collateral(&evidence, &source)
-            .context("fetch collateral")?;
+        let fetched = fetch_collateral(&evidence, &source).context("fetch collateral")?;
         endorsements.extend(fetched);
     }
 
-    Ok(BuildInput {
-        evidence,
-        evidence_media_type: args.evidence_media_type.clone(),
-        component_source,
-        endorsements,
-    })
+    let mut builder =
+        BuildInput::builder(evidence).evidence_media_type(args.evidence_media_type.clone());
+    builder = match (&args.component, &args.component_id, &args.component_id_from) {
+        (Some(path), None, None) => builder.component(read_bytes(path, "component")?),
+        (None, Some(id), None) => builder.component_id(id.clone()),
+        (None, None, Some(path)) => {
+            builder.component_id_from_bytes(read_bytes(path, "component-id-from")?)
+        }
+        (None, None, None) => {
+            bail!("one of --component, --component-id, or --component-id-from must be provided")
+        }
+        _ => bail!("--component, --component-id, and --component-id-from are mutually exclusive"),
+    };
+
+    for endorsement in endorsements {
+        builder = builder.endorsement(endorsement);
+    }
+
+    Ok(builder.build()?)
 }
 
 fn collateral_source(tee: TeeKind, args: &Args) -> CollateralSource {
@@ -241,8 +254,12 @@ fn collateral_source(tee: TeeKind, args: &Args) -> CollateralSource {
             kds_base_url: args.kds_url.clone(),
             product_name: args.snp_product.clone(),
         }),
-        TeeKind::Tdx => CollateralSource::Tdx(TdxCollateralOptions),
-        TeeKind::Sgx => CollateralSource::Sgx(SgxCollateralOptions),
+        TeeKind::Tdx => CollateralSource::Tdx(TdxCollateralOptions {
+            pccs_base_url: args.tdx_pccs_url.clone(),
+        }),
+        TeeKind::Sgx => CollateralSource::Sgx(SgxCollateralOptions {
+            pccs_base_url: args.sgx_pccs_url.clone(),
+        }),
     }
 }
 

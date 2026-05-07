@@ -1,7 +1,7 @@
 pub mod collateral;
 pub use collateral::{
-    CollateralSource, SgxCollateralOptions, SnpCollateralOptions, TdxCollateralOptions,
-    fetch_collateral,
+    fetch_collateral, CollateralSource, SgxCollateralOptions, SnpCollateralOptions,
+    TdxCollateralOptions,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -18,6 +18,7 @@ pub const TRUSTMEE_EAT_PROFILE: &str = "https://trustmee.invalid/eat/component-e
 pub const WASM_MEDIA_TYPE: &str = "application/wasm";
 pub const CMW_INDICATOR_ENDORSEMENT: u64 = 2;
 pub const CMW_INDICATOR_EVIDENCE: u64 = 4;
+pub const DEFAULT_EVIDENCE_MEDIA_TYPE: &str = "application/octet-stream";
 
 const COMPONENT_ID_PREFIX: &str = "component-";
 const CMW_COLLECTION_TYPE_KEY: &str = "__cmwc_t";
@@ -33,7 +34,7 @@ pub enum Error {
     EmptyEvidenceMediaType,
     #[error("component bytes must not be empty")]
     EmptyComponentBytes,
-    #[error("component_id must start with `component-` followed by 64 lowercase hex characters")]
+    #[error("component_id must be either `component-<sha256-hex>` or an `oci://`/`oci+http(s)://`/`http(s)://`/`file://` URL")]
     MalformedComponentId,
     #[error("endorsement label must not be empty")]
     EmptyEndorsementLabel,
@@ -47,6 +48,8 @@ pub enum Error {
     UnsupportedHashAlgorithm(String),
     #[error("no component source set; call component(), component_id(), or component_id_from_bytes() on the builder")]
     MissingComponentSource,
+    #[error("no collateral source set; call collateral_source(), snp_collateral(), tdx_collateral(), or sgx_collateral() on the builder")]
+    MissingCollateralSource,
     #[error("JSON serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -303,7 +306,15 @@ fn resolve_component_id(source: &ComponentSource) -> String {
 }
 
 fn validate_component_id(component_id: &str) -> Result<()> {
-    let valid = component_id
+    if is_hash_form_component_id(component_id) || is_locator_form_component_id(component_id) {
+        Ok(())
+    } else {
+        Err(Error::MalformedComponentId)
+    }
+}
+
+fn is_hash_form_component_id(component_id: &str) -> bool {
+    component_id
         .strip_prefix(COMPONENT_ID_PREFIX)
         .map(|digest| {
             digest.len() == 64
@@ -311,13 +322,27 @@ fn validate_component_id(component_id: &str) -> Result<()> {
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::MalformedComponentId)
-    }
+/// Returns true if `component_id` is a URL identifying an OCI artifact (or a
+/// local file-backed registry). The exact resolution semantics are owned by
+/// the verifier; this side only sanity-checks the scheme and that there is a
+/// non-empty remainder.
+fn is_locator_form_component_id(component_id: &str) -> bool {
+    const SCHEMES: &[&str] = &[
+        "oci://",
+        "oci+http://",
+        "oci+https://",
+        "http://",
+        "https://",
+        "file://",
+    ];
+    SCHEMES.iter().any(|scheme| {
+        component_id
+            .strip_prefix(scheme)
+            .is_some_and(|rest| !rest.is_empty())
+    })
 }
 
 fn validate_hash_algorithm(algorithm: &str) -> Result<()> {
@@ -358,10 +383,24 @@ pub struct BuildInputBuilder {
 }
 
 impl BuildInput {
+    /// Construct a [`BuildInput`] from evidence and verifier component bytes.
+    ///
+    /// The component ID is derived from the component bytes with SHA-256 when
+    /// the CMW is built; callers do not need to provide a component ID/hash for
+    /// this common stapled-component path.
+    pub fn new(evidence: impl Into<Vec<u8>>, component: impl Into<Vec<u8>>) -> Self {
+        Self {
+            evidence: evidence.into(),
+            evidence_media_type: DEFAULT_EVIDENCE_MEDIA_TYPE.to_string(),
+            component_source: ComponentSource::Bytes(component.into()),
+            endorsements: Vec::new(),
+        }
+    }
+
     pub fn builder(evidence: impl Into<Vec<u8>>) -> BuildInputBuilder {
         BuildInputBuilder {
             evidence: evidence.into(),
-            evidence_media_type: "application/octet-stream".to_string(),
+            evidence_media_type: DEFAULT_EVIDENCE_MEDIA_TYPE.to_string(),
             component_source: None,
             endorsements: Vec::new(),
         }
@@ -382,9 +421,25 @@ impl BuildInputBuilder {
     }
 
     /// Reference the component by a pre-computed ID; no bytes are included in the output.
+    ///
+    /// Accepts either a content-addressed `component-<sha256-hex>` ID or a
+    /// locator URL (`oci://...`, `oci+http(s)://...`, `http(s)://...`, or
+    /// `file://...`) — see [`Self::component_oci_url`] for a self-documenting
+    /// builder method dedicated to the URL form.
     pub fn component_id(mut self, id: impl Into<String>) -> Self {
         self.component_source = Some(ComponentSource::Id(id.into()));
         self
+    }
+
+    /// Reference the component by an OCI/HTTP/file locator URL; no bytes are
+    /// included in the output. Equivalent to passing the URL through
+    /// [`Self::component_id`], but communicates intent.
+    ///
+    /// Trust under this mode rests with the registry/transport (TLS, OCI
+    /// digest pinning) and the verifier's component-signature trust store —
+    /// not on byte-level equality with a hash claim.
+    pub fn component_oci_url(self, url: impl Into<String>) -> Self {
+        self.component_id(url)
     }
 
     /// Derive the component ID from bytes via SHA-256 without stapling the bytes in the output.
@@ -400,9 +455,7 @@ impl BuildInputBuilder {
     }
 
     pub fn build(self) -> Result<BuildInput> {
-        let component_source = self
-            .component_source
-            .ok_or(Error::MissingComponentSource)?;
+        let component_source = self.component_source.ok_or(Error::MissingComponentSource)?;
         Ok(BuildInput {
             evidence: self.evidence,
             evidence_media_type: self.evidence_media_type,
@@ -602,7 +655,10 @@ pub mod trustmee_coco_client {
     use reqwest::Client;
     use std::time::Duration;
 
-    use crate::{BuildInput, BuiltTrustMeeInput, ComponentSource, Endorsement, build_trustmee_json_cmw};
+    use crate::{
+        build_trustmee_json_cmw, BuildInput, BuiltTrustMeeInput, ComponentSource, Endorsement,
+        Error as TrustMeeError, DEFAULT_EVIDENCE_MEDIA_TYPE,
+    };
 
     pub const DEFAULT_COCO_EVIDENCE_URL: &str = "http://127.0.0.1:8006/aa/evidence";
 
@@ -618,8 +674,7 @@ pub mod trustmee_coco_client {
     pub fn fetch_evidence_from_aa(url: &str, runtime_data: Option<&[u8]>) -> Result<Vec<u8>> {
         let mut request_url = url.to_string();
         if let Some(bytes) = runtime_data {
-            let s = std::str::from_utf8(bytes)
-                .context("runtime_data is not valid UTF-8")?;
+            let s = std::str::from_utf8(bytes).context("runtime_data is not valid UTF-8")?;
             if request_url.contains('?') {
                 request_url.push_str("&runtime_data=");
             } else {
@@ -648,9 +703,302 @@ pub mod trustmee_coco_client {
     // Async client — for use as a library crate in async applications.
     // -------------------------------------------------------------------------
 
+    /// Converts either a built [`CocoBuildOptions`] or its builder into request
+    /// options for [`CocoClient::build_trustmee_json_cmw_coco`].
+    pub trait IntoCocoBuildOptions {
+        fn into_coco_build_options(self) -> Result<CocoBuildOptions>;
+    }
+
+    /// Options for fetching CoCo evidence and building a TrustMee CMW.
+    ///
+    /// Safe defaults:
+    /// - no runtime data
+    /// - `application/octet-stream` evidence media type
+    /// - no additional endorsements
+    ///
+    /// The verifier component source is intentionally required because it is a
+    /// trust decision, not a transport detail.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct CocoBuildOptions {
+        pub runtime_data: Option<Vec<u8>>,
+        pub evidence_media_type: String,
+        pub component_source: ComponentSource,
+        pub endorsements: Vec<Endorsement>,
+    }
+
+    impl CocoBuildOptions {
+        pub fn new() -> CocoBuildOptionsBuilder {
+            CocoBuildOptionsBuilder::default()
+        }
+
+        pub fn builder() -> CocoBuildOptionsBuilder {
+            Self::new()
+        }
+
+        fn into_build_input(self, evidence: Vec<u8>) -> BuildInput {
+            BuildInput {
+                evidence,
+                evidence_media_type: self.evidence_media_type,
+                component_source: self.component_source,
+                endorsements: self.endorsements,
+            }
+        }
+    }
+
+    impl IntoCocoBuildOptions for CocoBuildOptions {
+        fn into_coco_build_options(self) -> Result<CocoBuildOptions> {
+            Ok(self)
+        }
+    }
+
+    /// Builder for [`CocoBuildOptions`].
+    pub struct CocoBuildOptionsBuilder {
+        runtime_data: Option<Vec<u8>>,
+        evidence_media_type: String,
+        component_source: Option<ComponentSource>,
+        endorsements: Vec<Endorsement>,
+    }
+
+    impl Default for CocoBuildOptionsBuilder {
+        fn default() -> Self {
+            Self {
+                runtime_data: None,
+                evidence_media_type: DEFAULT_EVIDENCE_MEDIA_TYPE.to_string(),
+                component_source: None,
+                endorsements: Vec::new(),
+            }
+        }
+    }
+
+    impl CocoBuildOptionsBuilder {
+        /// Attach runtime data to the Attestation Agent evidence request.
+        pub fn runtime_data(mut self, data: impl AsRef<[u8]>) -> Self {
+            self.runtime_data = Some(data.as_ref().to_vec());
+            self
+        }
+
+        /// Clear runtime data after it was set earlier in the builder chain.
+        pub fn no_runtime_data(mut self) -> Self {
+            self.runtime_data = None;
+            self
+        }
+
+        /// Override the default evidence media type (`application/octet-stream`).
+        pub fn evidence_media_type(mut self, media_type: impl Into<String>) -> Self {
+            self.evidence_media_type = media_type.into();
+            self
+        }
+
+        /// Staple the component bytes in the output; ID is derived via SHA-256.
+        pub fn component(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+            self.component_source = Some(ComponentSource::Bytes(bytes.into()));
+            self
+        }
+
+        /// Reference the component by a pre-computed ID or supported locator URL.
+        pub fn component_id(mut self, id: impl Into<String>) -> Self {
+            self.component_source = Some(ComponentSource::Id(id.into()));
+            self
+        }
+
+        /// Reference the component by an OCI/HTTP/file locator URL.
+        pub fn component_oci_url(self, url: impl Into<String>) -> Self {
+            self.component_id(url)
+        }
+
+        /// Derive the component ID from bytes without stapling the bytes.
+        pub fn component_id_from_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+            self.component_source = Some(ComponentSource::BytesForId(bytes.into()));
+            self
+        }
+
+        /// Add one endorsement to the generated CMW.
+        pub fn endorsement(mut self, endorsement: Endorsement) -> Self {
+            self.endorsements.push(endorsement);
+            self
+        }
+
+        /// Replace the endorsement list in full.
+        pub fn endorsements(mut self, endorsements: impl Into<Vec<Endorsement>>) -> Self {
+            self.endorsements = endorsements.into();
+            self
+        }
+
+        pub fn build(self) -> Result<CocoBuildOptions> {
+            let component_source = self
+                .component_source
+                .ok_or(TrustMeeError::MissingComponentSource)?;
+
+            Ok(CocoBuildOptions {
+                runtime_data: self.runtime_data,
+                evidence_media_type: self.evidence_media_type,
+                component_source,
+                endorsements: self.endorsements,
+            })
+        }
+    }
+
+    impl IntoCocoBuildOptions for CocoBuildOptionsBuilder {
+        fn into_coco_build_options(self) -> Result<CocoBuildOptions> {
+            self.build()
+        }
+    }
+
+    /// Converts either built [`CocoBuildWithCollateralOptions`] or its builder
+    /// into request options for
+    /// [`CocoClient::build_trustmee_json_cmw_coco_with_collateral`].
+    #[cfg(feature = "fetch-collateral")]
+    pub trait IntoCocoBuildWithCollateralOptions {
+        fn into_coco_build_with_collateral_options(self) -> Result<CocoBuildWithCollateralOptions>;
+    }
+
+    /// Options for fetching CoCo evidence, fetching vendor collateral, and
+    /// building a TrustMee CMW.
+    #[cfg(feature = "fetch-collateral")]
+    #[derive(Clone, Debug)]
+    pub struct CocoBuildWithCollateralOptions {
+        pub build_options: CocoBuildOptions,
+        pub collateral_source: crate::CollateralSource,
+    }
+
+    #[cfg(feature = "fetch-collateral")]
+    impl CocoBuildWithCollateralOptions {
+        pub fn new() -> CocoBuildWithCollateralOptionsBuilder {
+            CocoBuildWithCollateralOptionsBuilder::default()
+        }
+
+        pub fn builder() -> CocoBuildWithCollateralOptionsBuilder {
+            Self::new()
+        }
+    }
+
+    #[cfg(feature = "fetch-collateral")]
+    impl IntoCocoBuildWithCollateralOptions for CocoBuildWithCollateralOptions {
+        fn into_coco_build_with_collateral_options(self) -> Result<CocoBuildWithCollateralOptions> {
+            Ok(self)
+        }
+    }
+
+    /// Builder for [`CocoBuildWithCollateralOptions`].
+    #[cfg(feature = "fetch-collateral")]
+    pub struct CocoBuildWithCollateralOptionsBuilder {
+        build_options: CocoBuildOptionsBuilder,
+        collateral_source: Option<crate::CollateralSource>,
+    }
+
+    #[cfg(feature = "fetch-collateral")]
+    impl Default for CocoBuildWithCollateralOptionsBuilder {
+        fn default() -> Self {
+            Self {
+                build_options: CocoBuildOptions::new(),
+                collateral_source: None,
+            }
+        }
+    }
+
+    #[cfg(feature = "fetch-collateral")]
+    impl CocoBuildWithCollateralOptionsBuilder {
+        pub fn runtime_data(mut self, data: impl AsRef<[u8]>) -> Self {
+            self.build_options = self.build_options.runtime_data(data);
+            self
+        }
+
+        pub fn no_runtime_data(mut self) -> Self {
+            self.build_options = self.build_options.no_runtime_data();
+            self
+        }
+
+        pub fn evidence_media_type(mut self, media_type: impl Into<String>) -> Self {
+            self.build_options = self.build_options.evidence_media_type(media_type);
+            self
+        }
+
+        pub fn component(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+            self.build_options = self.build_options.component(bytes);
+            self
+        }
+
+        pub fn component_id(mut self, id: impl Into<String>) -> Self {
+            self.build_options = self.build_options.component_id(id);
+            self
+        }
+
+        pub fn component_oci_url(mut self, url: impl Into<String>) -> Self {
+            self.build_options = self.build_options.component_oci_url(url);
+            self
+        }
+
+        pub fn component_id_from_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+            self.build_options = self.build_options.component_id_from_bytes(bytes);
+            self
+        }
+
+        pub fn endorsement(mut self, endorsement: Endorsement) -> Self {
+            self.build_options = self.build_options.endorsement(endorsement);
+            self
+        }
+
+        pub fn endorsements(mut self, endorsements: impl Into<Vec<Endorsement>>) -> Self {
+            self.build_options = self.build_options.endorsements(endorsements);
+            self
+        }
+
+        /// Set the collateral source explicitly.
+        pub fn collateral_source(mut self, source: crate::CollateralSource) -> Self {
+            self.collateral_source = Some(source);
+            self
+        }
+
+        /// Fetch AMD SEV-SNP collateral using default KDS options.
+        pub fn snp_collateral(self) -> Self {
+            self.collateral_source(crate::CollateralSource::Snp(
+                crate::SnpCollateralOptions::default(),
+            ))
+        }
+
+        /// Fetch Intel TDX collateral using default PCS options.
+        pub fn tdx_collateral(self) -> Self {
+            self.collateral_source(crate::CollateralSource::Tdx(
+                crate::TdxCollateralOptions::default(),
+            ))
+        }
+
+        /// Fetch Intel SGX collateral using default PCCS options.
+        pub fn sgx_collateral(self) -> Self {
+            self.collateral_source(crate::CollateralSource::Sgx(
+                crate::SgxCollateralOptions::default(),
+            ))
+        }
+
+        pub fn build(self) -> Result<CocoBuildWithCollateralOptions> {
+            let build_options = self.build_options.build()?;
+            let collateral_source = self
+                .collateral_source
+                .ok_or(TrustMeeError::MissingCollateralSource)?;
+
+            Ok(CocoBuildWithCollateralOptions {
+                build_options,
+                collateral_source,
+            })
+        }
+    }
+
+    #[cfg(feature = "fetch-collateral")]
+    impl IntoCocoBuildWithCollateralOptions for CocoBuildWithCollateralOptionsBuilder {
+        fn into_coco_build_with_collateral_options(self) -> Result<CocoBuildWithCollateralOptions> {
+            self.build()
+        }
+    }
+
     pub struct CocoClientBuilder {
         url: String,
         timeout: Duration,
+    }
+
+    impl Default for CocoClientBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl CocoClientBuilder {
@@ -702,14 +1050,10 @@ pub mod trustmee_coco_client {
         ///
         /// `runtime_data` is appended to the request URL as a UTF-8 string,
         /// which is the format the CoCo AA / TDX hardware expects.
-        pub async fn fetch_evidence_bytes(
-            &self,
-            runtime_data: Option<&[u8]>,
-        ) -> Result<Vec<u8>> {
+        pub async fn fetch_evidence_bytes(&self, runtime_data: Option<&[u8]>) -> Result<Vec<u8>> {
             let mut url = self.aa_url.clone();
             if let Some(bytes) = runtime_data {
-                let s = std::str::from_utf8(bytes)
-                    .context("runtime_data is not valid UTF-8")?;
+                let s = std::str::from_utf8(bytes).context("runtime_data is not valid UTF-8")?;
                 if url.contains('?') {
                     url.push_str("&runtime_data=");
                 } else {
@@ -750,20 +1094,13 @@ pub mod trustmee_coco_client {
         /// have collateral fetched automatically.
         pub async fn build_trustmee_json_cmw_coco(
             &self,
-            runtime_data: Option<&[u8]>,
-            component_source: ComponentSource,
-            evidence_media_type: Option<String>,
-            endorsements: Option<Vec<Endorsement>>,
+            options: impl IntoCocoBuildOptions,
         ) -> Result<BuiltTrustMeeInput> {
-            let evidence = self.fetch_evidence_bytes(runtime_data).await?;
-            let media_type =
-                evidence_media_type.unwrap_or_else(|| "application/octet-stream".into());
-            let input = BuildInput {
-                evidence,
-                evidence_media_type: media_type,
-                component_source,
-                endorsements: endorsements.unwrap_or_default(),
-            };
+            let options = options.into_coco_build_options()?;
+            let evidence = self
+                .fetch_evidence_bytes(options.runtime_data.as_deref())
+                .await?;
+            let input = options.into_build_input(evidence);
             Ok(build_trustmee_json_cmw(&input)?)
         }
     }
@@ -777,24 +1114,15 @@ pub mod trustmee_coco_client {
         /// and attaches it as endorsements before building the CMW.
         pub async fn build_trustmee_json_cmw_coco_with_collateral(
             &self,
-            runtime_data: Option<&[u8]>,
-            component_source: ComponentSource,
-            evidence_media_type: Option<String>,
-            endorsements: Option<Vec<Endorsement>>,
-            collateral_source: &crate::CollateralSource,
+            options: impl IntoCocoBuildWithCollateralOptions,
         ) -> Result<BuiltTrustMeeInput> {
-            let evidence = self.fetch_evidence_bytes(runtime_data).await?;
-            let media_type =
-                evidence_media_type.unwrap_or_else(|| "application/octet-stream".into());
-            let mut all_endorsements = endorsements.unwrap_or_default();
-            let fetched = crate::fetch_collateral(&evidence, collateral_source)?;
-            all_endorsements.extend(fetched);
-            let input = BuildInput {
-                evidence,
-                evidence_media_type: media_type,
-                component_source,
-                endorsements: all_endorsements,
-            };
+            let options = options.into_coco_build_with_collateral_options()?;
+            let evidence = self
+                .fetch_evidence_bytes(options.build_options.runtime_data.as_deref())
+                .await?;
+            let fetched = crate::fetch_collateral(&evidence, &options.collateral_source)?;
+            let mut input = options.build_options.into_build_input(evidence);
+            input.endorsements.extend(fetched);
             Ok(build_trustmee_json_cmw(&input)?)
         }
     }

@@ -7,24 +7,43 @@
 //! Requires the `fetch-collateral` Cargo feature (enabled by default).
 
 use crate::Endorsement;
-use anyhow::{bail, Context, Result};
+#[cfg(any(feature = "fetch-collateral", test))]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(any(feature = "fetch-collateral", test))]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(any(feature = "fetch-collateral", test))]
 use base64::Engine as _;
+#[cfg(any(feature = "fetch-collateral", test))]
+use ciborium::into_writer;
+#[cfg(any(feature = "fetch-collateral", test))]
+use dcap_qvl::QuoteCollateralV3;
+#[cfg(any(feature = "fetch-collateral", test))]
+use serde::Serialize;
+#[cfg(any(feature = "fetch-collateral", test))]
 use serde_json::Value;
+#[cfg(any(feature = "fetch-collateral", test))]
+use sev::firmware::host::{CertTableEntry, CertType};
 
 // ── Media types ───────────────────────────────────────────────────────────────
 
 pub const MEDIA_PKIX_CERT: &str = "application/pkix-cert";
 pub const MEDIA_PEM_CHAIN: &str = "application/pem-certificate-chain";
 pub const MEDIA_JSON: &str = "application/json";
+pub const SNP_COLLATERAL_MEDIA_TYPE: &str = "application/vnd.trustmee.snp-collateral+cbor";
+pub const TDX_COLLATERAL_MEDIA_TYPE: &str = "application/vnd.trustmee.tdx-collateral+cbor";
+pub const SGX_COLLATERAL_MEDIA_TYPE: &str = "application/vnd.trustmee.sgx-collateral+cbor";
 
 // ── Endorsement labels ────────────────────────────────────────────────────────
 
 pub const SNP_VCEK_LABEL: &str = "snp-vcek";
 pub const SNP_CERT_CHAIN_LABEL: &str = "snp-cert-chain";
+pub const SNP_COLLATERAL_LABEL: &str = "snp-collateral";
+pub const TDX_COLLATERAL_LABEL: &str = "tdx-collateral";
 pub const TDX_PCK_CHAIN_LABEL: &str = "tdx-pck-chain";
 pub const TDX_TCB_INFO_LABEL: &str = "tdx-tcb-info";
 pub const TDX_QE_IDENTITY_LABEL: &str = "tdx-qe-identity";
+pub const SGX_COLLATERAL_LABEL: &str = "sgx-collateral";
 pub const SGX_PCK_CHAIN_LABEL: &str = "sgx-pck-chain";
 pub const SGX_TCB_INFO_LABEL: &str = "sgx-tcb-info";
 pub const SGX_QE_IDENTITY_LABEL: &str = "sgx-qe-identity";
@@ -36,6 +55,12 @@ pub const INTEL_PCS_TDX_BASE_URL: &str =
     "https://api.trustedservices.intel.com/tdx/certification/v4";
 pub const INTEL_PCS_SGX_BASE_URL: &str =
     "https://api.trustedservices.intel.com/sgx/certification/v4";
+/// Phala Network's public PCCS — proxies Intel PCS for TCB/QE-identity and
+/// also serves the `pckcert` endpoint without an `Ocp-Apim-Subscription-Key`
+/// header. Used as the SGX default so quotes with `cert_type` 2/3 (encrypted
+/// PPID) — where the PCK certificate must be fetched rather than read from
+/// the quote — work out of the box.
+pub const PHALA_PCCS_BASE_URL: &str = "https://pccs.phala.network";
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -60,13 +85,41 @@ impl Default for SnpCollateralOptions {
 }
 
 /// Options for fetching Intel TDX collateral from the Intel Provisioning
-/// Certification Service (PCS).
-#[derive(Clone, Debug, Default)]
-pub struct TdxCollateralOptions;
+/// Certification Service (PCS) or a compatible PCCS.
+#[derive(Clone, Debug)]
+pub struct TdxCollateralOptions {
+    /// Base URL of the PCS/PCCS to query. Defaults to [`INTEL_PCS_TDX_BASE_URL`].
+    pub pccs_base_url: String,
+}
 
-/// Options for fetching Intel SGX collateral from the Intel PCS.
-#[derive(Clone, Debug, Default)]
-pub struct SgxCollateralOptions;
+impl Default for TdxCollateralOptions {
+    fn default() -> Self {
+        Self {
+            pccs_base_url: INTEL_PCS_TDX_BASE_URL.to_string(),
+        }
+    }
+}
+
+/// Options for fetching Intel SGX collateral from a PCS/PCCS.
+///
+/// SGX quotes commonly use certification data type 2 or 3 (encrypted PPID),
+/// where the PCK certificate is *not* embedded in the quote and must be
+/// fetched from a PCCS. Intel's PCS gates that endpoint behind a subscription
+/// key, so the default is [`PHALA_PCCS_BASE_URL`] which serves it without
+/// authentication.
+#[derive(Clone, Debug)]
+pub struct SgxCollateralOptions {
+    /// Base URL of the PCS/PCCS to query. Defaults to [`PHALA_PCCS_BASE_URL`].
+    pub pccs_base_url: String,
+}
+
+impl Default for SgxCollateralOptions {
+    fn default() -> Self {
+        Self {
+            pccs_base_url: PHALA_PCCS_BASE_URL.to_string(),
+        }
+    }
+}
 
 /// Specifies the TEE type and service options for collateral fetching.
 #[derive(Clone, Debug)]
@@ -88,10 +141,7 @@ pub enum CollateralSource {
 /// the CMW alongside the evidence.
 ///
 /// Requires the `fetch-collateral` Cargo feature (enabled by default).
-pub fn fetch_collateral(
-    evidence: &[u8],
-    source: &CollateralSource,
-) -> Result<Vec<Endorsement>> {
+pub fn fetch_collateral(evidence: &[u8], source: &CollateralSource) -> Result<Vec<Endorsement>> {
     match source {
         CollateralSource::Snp(opts) => fetch_snp(evidence, opts),
         CollateralSource::Tdx(opts) => fetch_tdx(evidence, opts),
@@ -101,6 +151,7 @@ pub fn fetch_collateral(
 
 // ── SNP ───────────────────────────────────────────────────────────────────────
 
+#[cfg(any(feature = "fetch-collateral", test))]
 struct SnpFields {
     chip_id_hex: String,
     bl_svn: u8,
@@ -110,9 +161,34 @@ struct SnpFields {
     product_name: String,
 }
 
+#[cfg(any(feature = "fetch-collateral", test))]
+#[derive(Serialize)]
+struct SnpCollateral {
+    cert_chain: Vec<CertTableEntry>,
+}
+
+#[cfg(any(feature = "fetch-collateral", test))]
+fn snp_vcek_collateral_endorsement(vcek_bytes: Vec<u8>) -> Result<Endorsement> {
+    let collateral = SnpCollateral {
+        cert_chain: vec![CertTableEntry {
+            cert_type: CertType::VCEK,
+            data: vcek_bytes,
+        }],
+    };
+
+    let mut payload = Vec::new();
+    into_writer(&collateral, &mut payload).context("encode SNP collateral as CBOR")?;
+
+    Ok(Endorsement::new(
+        SNP_COLLATERAL_LABEL,
+        SNP_COLLATERAL_MEDIA_TYPE,
+        payload,
+    ))
+}
+
+#[cfg(any(feature = "fetch-collateral", test))]
 fn parse_snp_evidence(evidence: &[u8]) -> Result<SnpFields> {
-    let json: Value =
-        serde_json::from_slice(evidence).context("SNP evidence is not valid JSON")?;
+    let json: Value = serde_json::from_slice(evidence).context("SNP evidence is not valid JSON")?;
 
     let report = json
         .get("attestation_report")
@@ -168,6 +244,7 @@ fn parse_snp_evidence(evidence: &[u8]) -> Result<SnpFields> {
     })
 }
 
+#[cfg(any(feature = "fetch-collateral", test))]
 fn snp_product_name(cpuid_fam: u64, cpuid_mod: u64) -> &'static str {
     match (cpuid_fam, cpuid_mod) {
         (25, 0..=15) => "Milan",
@@ -199,31 +276,18 @@ fn fetch_snp(evidence: &[u8], opts: &SnpCollateralOptions) -> Result<Vec<Endorse
         .context("read VCEK cert body")?
         .to_vec();
 
-    let chain_url = format!("{kds}/vcek/v1/{product}/cert_chain");
-    let chain_bytes = client
-        .get(&chain_url)
-        .send()
-        .with_context(|| format!("GET {chain_url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error from {chain_url}"))?
-        .bytes()
-        .context("read cert chain body")?
-        .to_vec();
-
-    Ok(vec![
-        Endorsement::new(SNP_VCEK_LABEL, MEDIA_PKIX_CERT, vcek_bytes),
-        Endorsement::new(SNP_CERT_CHAIN_LABEL, MEDIA_PEM_CHAIN, chain_bytes),
-    ])
+    Ok(vec![snp_vcek_collateral_endorsement(vcek_bytes)?])
 }
 
 #[cfg(not(feature = "fetch-collateral"))]
 fn fetch_snp(_evidence: &[u8], _opts: &SnpCollateralOptions) -> Result<Vec<Endorsement>> {
-    bail!("collateral fetching requires the `fetch-collateral` Cargo feature")
+    anyhow::bail!("collateral fetching requires the `fetch-collateral` Cargo feature")
 }
 
 // ── TDX / SGX shared quote parsing ───────────────────────────────────────────
 
 /// Parsed fields extracted from a binary ECDSA DCAP quote (TDX or SGX).
+#[cfg(test)]
 struct QuoteFields {
     /// PEM-encoded PCK cert chain (leaf PCK cert + intermediate + root).
     pck_chain_pem: Vec<u8>,
@@ -231,22 +295,26 @@ struct QuoteFields {
     fmspc_hex: String,
 }
 
-fn parse_dcap_quote(evidence: &[u8], report_body_size: usize, tee_type: u32) -> Result<QuoteFields> {
+#[cfg(test)]
+fn parse_dcap_quote(
+    evidence: &[u8],
+    report_body_size: usize,
+    tee_type: u32,
+) -> Result<QuoteFields> {
     if evidence.len() < 48 {
-        bail!("quote too short for header ({} bytes)", evidence.len());
+        anyhow::bail!("quote too short for header ({} bytes)", evidence.len());
     }
     let version = u16::from_le_bytes([evidence[0], evidence[1]]);
-    let actual_tee =
-        u32::from_le_bytes(evidence[4..8].try_into().expect("slice always 4 bytes"));
+    let actual_tee = u32::from_le_bytes(evidence[4..8].try_into().expect("slice always 4 bytes"));
     if actual_tee != tee_type {
-        bail!("expected TEE type 0x{tee_type:08x}, got 0x{actual_tee:08x}");
+        anyhow::bail!("expected TEE type 0x{tee_type:08x}, got 0x{actual_tee:08x}");
     }
 
     let _ = version; // version check left to callers
 
     let sig_len_offset = 48 + report_body_size;
     if evidence.len() < sig_len_offset + 4 {
-        bail!("quote truncated before signature length field");
+        anyhow::bail!("quote truncated before signature length field");
     }
     let sig_len = u32::from_le_bytes(
         evidence[sig_len_offset..sig_len_offset + 4]
@@ -255,7 +323,7 @@ fn parse_dcap_quote(evidence: &[u8], report_body_size: usize, tee_type: u32) -> 
     ) as usize;
     let sig_start = sig_len_offset + 4;
     if evidence.len() < sig_start + sig_len {
-        bail!("quote truncated in signature data");
+        anyhow::bail!("quote truncated in signature data");
     }
     let sig_data = &evidence[sig_start..sig_start + sig_len];
     extract_pck_chain(sig_data)
@@ -263,18 +331,19 @@ fn parse_dcap_quote(evidence: &[u8], report_body_size: usize, tee_type: u32) -> 
 
 /// Navigate the ECDSA-256 signature data to locate the PEM PCK cert chain and
 /// extract the FMSPC from the leaf certificate.
+#[cfg(test)]
 fn extract_pck_chain(sig_data: &[u8]) -> Result<QuoteFields> {
     // Layout: ECDSA sig (64) + attest pubkey (64) + cert data type (2) +
     //         cert data len (4) + cert data (variable)
     if sig_data.len() < 134 {
-        bail!("ECDSA signature data too short ({} bytes)", sig_data.len());
+        anyhow::bail!("ECDSA signature data too short ({} bytes)", sig_data.len());
     }
 
     let cert_type = u16::from_le_bytes([sig_data[128], sig_data[129]]);
     let cert_len =
         u32::from_le_bytes(sig_data[130..134].try_into().expect("slice always 4 bytes")) as usize;
     if sig_data.len() < 134 + cert_len {
-        bail!("cert data truncated in signature block");
+        anyhow::bail!("cert data truncated in signature block");
     }
     let cert_data = &sig_data[134..134 + cert_len];
 
@@ -283,7 +352,7 @@ fn extract_pck_chain(sig_data: &[u8]) -> Result<QuoteFields> {
         5 => cert_data.to_vec(),
         // Type 6: QE report cert data — PCK chain nested inside as type 5
         6 => extract_pck_chain_from_type6(cert_data)?,
-        t => bail!("unsupported ECDSA cert data type {t}; expected 5 or 6"),
+        t => anyhow::bail!("unsupported ECDSA cert data type {t}; expected 5 or 6"),
     };
 
     let fmspc_hex = fmspc_from_pck_pem(&pck_pem)?;
@@ -302,16 +371,17 @@ fn extract_pck_chain(sig_data: &[u8]) -> Result<QuoteFields> {
 /// - QE Report signature (64 bytes)
 /// - QE auth data: length (2 bytes LE) + data
 /// - Inner cert data: type (2 bytes LE) + length (4 bytes LE) + data
+#[cfg(test)]
 fn extract_pck_chain_from_type6(cert_data: &[u8]) -> Result<Vec<u8>> {
     let mut off = 384 + 64; // skip QE report + QE report sig
     if cert_data.len() < off + 2 {
-        bail!("type-6 cert data truncated before QE auth length");
+        anyhow::bail!("type-6 cert data truncated before QE auth length");
     }
     let auth_len = u16::from_le_bytes([cert_data[off], cert_data[off + 1]]) as usize;
     off += 2 + auth_len;
 
     if cert_data.len() < off + 6 {
-        bail!("type-6 cert data truncated before inner cert type/length");
+        anyhow::bail!("type-6 cert data truncated before inner cert type/length");
     }
     let inner_type = u16::from_le_bytes([cert_data[off], cert_data[off + 1]]);
     let inner_len = u32::from_le_bytes(
@@ -322,10 +392,12 @@ fn extract_pck_chain_from_type6(cert_data: &[u8]) -> Result<Vec<u8>> {
     off += 6;
 
     if inner_type != 5 {
-        bail!("unexpected inner cert type {inner_type} in type-6 data; expected 5 (PCK chain)");
+        anyhow::bail!(
+            "unexpected inner cert type {inner_type} in type-6 data; expected 5 (PCK chain)"
+        );
     }
     if cert_data.len() < off + inner_len {
-        bail!("inner PCK cert chain truncated");
+        anyhow::bail!("inner PCK cert chain truncated");
     }
     Ok(cert_data[off..off + inner_len].to_vec())
 }
@@ -335,6 +407,7 @@ fn extract_pck_chain_from_type6(cert_data: &[u8]) -> Result<Vec<u8>> {
 /// FMSPC lives in the SGX FMSPC extension (OID 1.2.840.113741.1.13.1.4),
 /// encoded as a 6-byte OCTET STRING. We locate it with a fast byte-pattern
 /// search on the DER-decoded leaf cert.
+#[cfg(any(feature = "fetch-collateral", test))]
 fn fmspc_from_pck_pem(pem: &[u8]) -> Result<String> {
     let pem_str = std::str::from_utf8(pem).context("PCK chain is not valid UTF-8")?;
 
@@ -367,7 +440,7 @@ fn fmspc_from_pck_pem(pem: &[u8]) -> Result<String> {
     let after = &der[idx + FMSPC_OID.len()..];
     // Expect: 04 06 <6 bytes FMSPC>
     if after.len() < 8 || after[0] != 0x04 || after[1] != 6 {
-        bail!(
+        anyhow::bail!(
             "unexpected DER encoding after FMSPC OID: {:02x?}",
             &after[..after.len().min(8)]
         );
@@ -375,90 +448,241 @@ fn fmspc_from_pck_pem(pem: &[u8]) -> Result<String> {
     Ok(hex::encode(&after[2..8]))
 }
 
+#[cfg(any(feature = "fetch-collateral", test))]
+fn quote_bytes_from_dcap_evidence(evidence: &[u8], tee: &str) -> Result<Vec<u8>> {
+    if let Ok(s) = std::str::from_utf8(evidence) {
+        if s.trim_start().starts_with('{') {
+            let json: Value =
+                serde_json::from_str(s).with_context(|| format!("parse {tee} evidence JSON"))?;
+            let quote = json
+                .get("quote")
+                .and_then(Value::as_str)
+                .with_context(|| format!("missing base64 `quote` field in {tee} evidence JSON"))?;
+            return BASE64_STANDARD
+                .decode(quote)
+                .with_context(|| format!("decode base64 {tee} quote"));
+        }
+    }
+
+    Ok(evidence.to_vec())
+}
+
+#[cfg(any(feature = "fetch-collateral", test))]
+fn dcap_collateral_endorsement(
+    label: &str,
+    media_type: &str,
+    collateral: &QuoteCollateralV3,
+) -> Result<Endorsement> {
+    let mut payload = Vec::new();
+    into_writer(collateral, &mut payload).context("encode DCAP collateral as CBOR")?;
+    Ok(Endorsement::new(label, media_type, payload))
+}
+
+#[cfg(feature = "fetch-collateral")]
+fn fetch_dcap_collateral_endorsement(
+    evidence: &[u8],
+    tee: &str,
+    label: &str,
+    media_type: &str,
+    pccs_base_url: &str,
+) -> Result<Endorsement> {
+    let quote = quote_bytes_from_dcap_evidence(evidence, tee)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create Tokio runtime for collateral fetch")?;
+    let collateral = runtime
+        .block_on(fetch_quote_collateral(&quote, pccs_base_url))
+        .with_context(|| format!("fetch {tee} collateral from {pccs_base_url}"))?;
+
+    dcap_collateral_endorsement(label, media_type, &collateral)
+}
+
+/// Fetch full DCAP collateral for a quote.
+///
+/// `dcap_qvl::collateral::get_collateral` rejects PCK responses whose
+/// `SGX-TCBm` header indicates that PCS matched the request to a *lower* TCB
+/// level than the one in the quote. That's a useful safety check on a
+/// freshly-attesting platform, but it makes verification of any quote whose
+/// platform TCB has since aged out impossible. Instead we:
+///
+/// 1. Read the PCK chain straight out of the quote when `cert_type == 5`, or
+///    fetch it via PCCS using the encrypted-PPID parameters when
+///    `cert_type ∈ {2, 3}` — without bailing on a TCBm mismatch.
+/// 2. Pull TCB info, QE identity, and CRLs via
+///    [`dcap_qvl::collateral::get_collateral_for_fmspc`].
+/// 3. Staple the PCK chain onto the resulting [`QuoteCollateralV3`].
+#[cfg(feature = "fetch-collateral")]
+async fn fetch_quote_collateral(quote: &[u8], pccs_base_url: &str) -> Result<QuoteCollateralV3> {
+    use dcap_qvl::quote::Quote;
+
+    const CERT_TYPE_ENCRYPTED_PPID_2048: u16 = 2;
+    const CERT_TYPE_ENCRYPTED_PPID_3072: u16 = 3;
+    const CERT_TYPE_PCK_CERT_CHAIN: u16 = 5;
+
+    let parsed = Quote::parse(quote).context("parse DCAP quote")?;
+    let cert_type = parsed.inner_cert_type();
+    let pck_chain_pem: String = match cert_type {
+        CERT_TYPE_PCK_CERT_CHAIN => String::from_utf8(parsed.inner_cert_data().to_vec())
+            .context("PCK cert chain in quote is not valid UTF-8")?,
+        CERT_TYPE_ENCRYPTED_PPID_2048 | CERT_TYPE_ENCRYPTED_PPID_3072 => {
+            let params = parsed
+                .encrypted_ppid_params()
+                .context("decode encrypted PPID parameters from quote cert data")?;
+            fetch_pck_certificate_chain(pccs_base_url, parsed.qeid(), &params).await?
+        }
+        other => {
+            anyhow::bail!("unsupported quote certification data type {other}; expected 2, 3, or 5")
+        }
+    };
+
+    let fmspc_hex = fmspc_from_pck_pem(pck_chain_pem.as_bytes())?;
+    let ca = pck_chain_ca(pck_chain_pem.as_bytes());
+
+    let mut collateral = dcap_qvl::collateral::get_collateral_for_fmspc(
+        pccs_base_url,
+        fmspc_hex.to_ascii_uppercase(),
+        ca,
+        parsed.header.is_sgx(),
+    )
+    .await
+    .with_context(|| format!("fetch FMSPC-keyed collateral for {fmspc_hex}"))?;
+    collateral.pck_certificate_chain = Some(pck_chain_pem);
+    Ok(collateral)
+}
+
+/// Fetch the PCK certificate chain from a PCS/PCCS by encrypted-PPID
+/// parameters, returning the leaf followed by its issuer chain in one PEM
+/// string. Tolerates `SGX-TCBm` headers indicating a lower-TCB match.
+#[cfg(feature = "fetch-collateral")]
+async fn fetch_pck_certificate_chain(
+    pccs_base_url: &str,
+    qeid: &[u8],
+    params: &dcap_qvl::quote::EncryptedPpidParams,
+) -> Result<String> {
+    let qeid = hex::encode_upper(qeid);
+    let encrypted_ppid = hex::encode_upper(&params.encrypted_ppid);
+    let cpusvn = hex::encode_upper(params.cpusvn);
+    let pcesvn = hex::encode_upper(params.pcesvn.to_le_bytes());
+    let pceid = hex::encode_upper(params.pceid);
+
+    let base_url = pccs_base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/sgx/certification/v4")
+        .trim_end_matches("/tdx/certification/v4");
+    let url = format!(
+        "{base_url}/sgx/certification/v4/pckcert\
+         ?qeid={qeid}&encrypted_ppid={encrypted_ppid}\
+         &cpusvn={cpusvn}&pcesvn={pcesvn}&pceid={pceid}"
+    );
+    let response = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP error fetching PCK certificate from {url}"))?;
+
+    let issuer_chain_raw = response
+        .headers()
+        .get("SGX-PCK-Certificate-Issuer-Chain")
+        .ok_or_else(|| {
+            anyhow::anyhow!("PCK response from {url} missing SGX-PCK-Certificate-Issuer-Chain")
+        })?
+        .to_str()
+        .context("PCK issuer chain header is not ASCII")?
+        .to_owned();
+    let issuer_chain = percent_decode(&issuer_chain_raw);
+    let pck_leaf = response.text().await.context("read PCK certificate body")?;
+    Ok(format!("{}\n{issuer_chain}", pck_leaf.trim_end()))
+}
+
+/// Minimal `application/x-www-form-urlencoded` decoder for HTTP header
+/// values. The `SGX-PCK-Certificate-Issuer-Chain` header is URL-encoded.
+#[cfg(feature = "fetch-collateral")]
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Detect whether a PCK leaf certificate was issued by Intel SGX PCK
+/// `Processor CA` or `Platform CA`. Returns the corresponding PCS query
+/// parameter (`"processor"` or `"platform"`).
+#[cfg(any(feature = "fetch-collateral", test))]
+fn pck_chain_ca(pem: &[u8]) -> &'static str {
+    let pem_str = match std::str::from_utf8(pem) {
+        Ok(s) => s,
+        Err(_) => return "processor",
+    };
+    let mut der_blob: Vec<u8> = Vec::new();
+    for chunk in pem_str.split("-----BEGIN CERTIFICATE-----").skip(1) {
+        let Some(end) = chunk.find("-----END CERTIFICATE-----") else {
+            continue;
+        };
+        let b64: String = chunk[..end].lines().map(str::trim).collect();
+        if let Ok(der) = BASE64_STANDARD.decode(&b64) {
+            der_blob.extend(der);
+        }
+    }
+    if der_blob
+        .windows(b"Intel SGX PCK Platform CA".len())
+        .any(|w| w == b"Intel SGX PCK Platform CA")
+    {
+        "platform"
+    } else {
+        "processor"
+    }
+}
+
 // ── TDX ───────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "fetch-collateral")]
-fn fetch_tdx(evidence: &[u8], _opts: &TdxCollateralOptions) -> Result<Vec<Endorsement>> {
-    let fields = parse_dcap_quote(evidence, 584, 0x00000081)
-        .context("parse TDX DCAP quote")?;
-
-    let client = reqwest::blocking::Client::new();
-
-    let tcb_url = format!("{INTEL_PCS_TDX_BASE_URL}/tcb?fmspc={}", fields.fmspc_hex);
-    let tcb_bytes = client
-        .get(&tcb_url)
-        .send()
-        .with_context(|| format!("GET {tcb_url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error from {tcb_url}"))?
-        .bytes()
-        .context("read TDX TCB info body")?
-        .to_vec();
-
-    let qe_url = format!("{INTEL_PCS_TDX_BASE_URL}/qe/identity");
-    let qe_bytes = client
-        .get(&qe_url)
-        .send()
-        .with_context(|| format!("GET {qe_url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error from {qe_url}"))?
-        .bytes()
-        .context("read TDX QE identity body")?
-        .to_vec();
-
-    Ok(vec![
-        Endorsement::new(TDX_PCK_CHAIN_LABEL, MEDIA_PEM_CHAIN, fields.pck_chain_pem),
-        Endorsement::new(TDX_TCB_INFO_LABEL, MEDIA_JSON, tcb_bytes),
-        Endorsement::new(TDX_QE_IDENTITY_LABEL, MEDIA_JSON, qe_bytes),
-    ])
+fn fetch_tdx(evidence: &[u8], opts: &TdxCollateralOptions) -> Result<Vec<Endorsement>> {
+    Ok(vec![fetch_dcap_collateral_endorsement(
+        evidence,
+        "TDX",
+        TDX_COLLATERAL_LABEL,
+        TDX_COLLATERAL_MEDIA_TYPE,
+        &opts.pccs_base_url,
+    )?])
 }
 
 #[cfg(not(feature = "fetch-collateral"))]
 fn fetch_tdx(_evidence: &[u8], _opts: &TdxCollateralOptions) -> Result<Vec<Endorsement>> {
-    bail!("collateral fetching requires the `fetch-collateral` Cargo feature")
+    anyhow::bail!("collateral fetching requires the `fetch-collateral` Cargo feature")
 }
 
 // ── SGX ───────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "fetch-collateral")]
-fn fetch_sgx(evidence: &[u8], _opts: &SgxCollateralOptions) -> Result<Vec<Endorsement>> {
-    let fields = parse_dcap_quote(evidence, 384, 0x00000000)
-        .context("parse SGX DCAP quote")?;
-
-    let client = reqwest::blocking::Client::new();
-
-    let tcb_url = format!("{INTEL_PCS_SGX_BASE_URL}/tcb?fmspc={}", fields.fmspc_hex);
-    let tcb_bytes = client
-        .get(&tcb_url)
-        .send()
-        .with_context(|| format!("GET {tcb_url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error from {tcb_url}"))?
-        .bytes()
-        .context("read SGX TCB info body")?
-        .to_vec();
-
-    let qe_url = format!("{INTEL_PCS_SGX_BASE_URL}/qe/identity");
-    let qe_bytes = client
-        .get(&qe_url)
-        .send()
-        .with_context(|| format!("GET {qe_url}"))?
-        .error_for_status()
-        .with_context(|| format!("HTTP error from {qe_url}"))?
-        .bytes()
-        .context("read SGX QE identity body")?
-        .to_vec();
-
-    Ok(vec![
-        Endorsement::new(SGX_PCK_CHAIN_LABEL, MEDIA_PEM_CHAIN, fields.pck_chain_pem),
-        Endorsement::new(SGX_TCB_INFO_LABEL, MEDIA_JSON, tcb_bytes),
-        Endorsement::new(SGX_QE_IDENTITY_LABEL, MEDIA_JSON, qe_bytes),
-    ])
+fn fetch_sgx(evidence: &[u8], opts: &SgxCollateralOptions) -> Result<Vec<Endorsement>> {
+    Ok(vec![fetch_dcap_collateral_endorsement(
+        evidence,
+        "SGX",
+        SGX_COLLATERAL_LABEL,
+        SGX_COLLATERAL_MEDIA_TYPE,
+        &opts.pccs_base_url,
+    )?])
 }
 
 #[cfg(not(feature = "fetch-collateral"))]
 fn fetch_sgx(_evidence: &[u8], _opts: &SgxCollateralOptions) -> Result<Vec<Endorsement>> {
-    bail!("collateral fetching requires the `fetch-collateral` Cargo feature")
+    anyhow::bail!("collateral fetching requires the `fetch-collateral` Cargo feature")
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -480,7 +704,11 @@ mod tests {
     #[test]
     fn snp_evidence_parses_chip_id_and_tcb() {
         let fields = parse_snp_evidence(&snp_evidence_bytes()).expect("parse SNP evidence");
-        assert_eq!(fields.chip_id_hex.len(), 128, "chip_id should be 64 bytes = 128 hex chars");
+        assert_eq!(
+            fields.chip_id_hex.len(),
+            128,
+            "chip_id should be 64 bytes = 128 hex chars"
+        );
         // Values from the test fixture
         assert_eq!(fields.bl_svn, 10);
         assert_eq!(fields.snp_svn, 23);
@@ -493,10 +721,15 @@ mod tests {
         let quote = tdx_quote_bytes();
         let fields = parse_dcap_quote(&quote, 584, 0x00000081).expect("parse TDX quote");
         assert!(
-            fields.pck_chain_pem.starts_with(b"-----BEGIN CERTIFICATE-----"),
+            fields
+                .pck_chain_pem
+                .starts_with(b"-----BEGIN CERTIFICATE-----"),
             "PCK chain should be PEM"
         );
-        assert_eq!(fields.fmspc_hex, "c0806f000000", "FMSPC should match test fixture");
+        assert_eq!(
+            fields.fmspc_hex, "c0806f000000",
+            "FMSPC should match test fixture"
+        );
     }
 
     #[test]
@@ -505,5 +738,74 @@ mod tests {
         assert_eq!(snp_product_name(25, 160), "Genoa");
         assert_eq!(snp_product_name(25, 176), "Bergamo");
         assert_eq!(snp_product_name(99, 0), "Milan"); // fallback
+    }
+
+    #[test]
+    fn snp_vcek_collateral_endorsement_matches_verifier_format() {
+        #[derive(serde::Deserialize)]
+        struct DecodedSnpCollateral {
+            cert_chain: Vec<CertTableEntry>,
+        }
+
+        let endorsement =
+            snp_vcek_collateral_endorsement(vec![1, 2, 3]).expect("build SNP collateral");
+
+        assert_eq!(endorsement.label, SNP_COLLATERAL_LABEL);
+        assert_eq!(endorsement.media_type, SNP_COLLATERAL_MEDIA_TYPE);
+
+        let decoded: DecodedSnpCollateral = ciborium::from_reader(endorsement.payload.as_slice())
+            .expect("decode SNP collateral CBOR");
+        assert_eq!(decoded.cert_chain.len(), 1);
+        assert_eq!(decoded.cert_chain[0].cert_type, CertType::VCEK);
+        assert_eq!(decoded.cert_chain[0].data, vec![1, 2, 3]);
+    }
+
+    fn sample_dcap_collateral() -> QuoteCollateralV3 {
+        QuoteCollateralV3 {
+            pck_crl_issuer_chain: "pck issuer".to_string(),
+            root_ca_crl: vec![1, 2],
+            pck_crl: vec![3, 4],
+            tcb_info_issuer_chain: "tcb issuer".to_string(),
+            tcb_info: r#"{"nextUpdate":"2035-01-01T00:00:00Z"}"#.to_string(),
+            tcb_info_signature: vec![5, 6],
+            qe_identity_issuer_chain: "qe issuer".to_string(),
+            qe_identity: r#"{"nextUpdate":"2035-01-01T00:00:00Z"}"#.to_string(),
+            qe_identity_signature: vec![7, 8],
+            pck_certificate_chain: Some("pck chain".to_string()),
+        }
+    }
+
+    #[test]
+    fn dcap_collateral_endorsement_matches_tdx_verifier_format() {
+        let endorsement = dcap_collateral_endorsement(
+            TDX_COLLATERAL_LABEL,
+            TDX_COLLATERAL_MEDIA_TYPE,
+            &sample_dcap_collateral(),
+        )
+        .expect("build TDX collateral");
+
+        assert_eq!(endorsement.label, TDX_COLLATERAL_LABEL);
+        assert_eq!(endorsement.media_type, TDX_COLLATERAL_MEDIA_TYPE);
+
+        let decoded: QuoteCollateralV3 = ciborium::from_reader(endorsement.payload.as_slice())
+            .expect("decode TDX collateral CBOR");
+        assert_eq!(decoded.pck_certificate_chain.as_deref(), Some("pck chain"));
+    }
+
+    #[test]
+    fn dcap_collateral_endorsement_matches_sgx_verifier_format() {
+        let endorsement = dcap_collateral_endorsement(
+            SGX_COLLATERAL_LABEL,
+            SGX_COLLATERAL_MEDIA_TYPE,
+            &sample_dcap_collateral(),
+        )
+        .expect("build SGX collateral");
+
+        assert_eq!(endorsement.label, SGX_COLLATERAL_LABEL);
+        assert_eq!(endorsement.media_type, SGX_COLLATERAL_MEDIA_TYPE);
+
+        let decoded: QuoteCollateralV3 = ciborium::from_reader(endorsement.payload.as_slice())
+            .expect("decode SGX collateral CBOR");
+        assert_eq!(decoded.qe_identity_signature, vec![7, 8]);
     }
 }
