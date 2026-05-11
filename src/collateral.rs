@@ -149,6 +149,20 @@ pub fn fetch_collateral(evidence: &[u8], source: &CollateralSource) -> Result<Ve
     }
 }
 
+/// Async variant of [`fetch_collateral`] for callers already running inside
+/// an async runtime.
+#[cfg(feature = "fetch-collateral")]
+pub async fn fetch_collateral_async(
+    evidence: &[u8],
+    source: &CollateralSource,
+) -> Result<Vec<Endorsement>> {
+    match source {
+        CollateralSource::Snp(opts) => fetch_snp_async(evidence, opts).await,
+        CollateralSource::Tdx(opts) => fetch_tdx_async(evidence, opts).await,
+        CollateralSource::Sgx(opts) => fetch_sgx_async(evidence, opts).await,
+    }
+}
+
 // ── SNP ───────────────────────────────────────────────────────────────────────
 
 #[cfg(any(feature = "fetch-collateral", test))]
@@ -273,6 +287,33 @@ fn fetch_snp(evidence: &[u8], opts: &SnpCollateralOptions) -> Result<Vec<Endorse
         .error_for_status()
         .with_context(|| format!("HTTP error from {vcek_url}"))?
         .bytes()
+        .context("read VCEK cert body")?
+        .to_vec();
+
+    Ok(vec![snp_vcek_collateral_endorsement(vcek_bytes)?])
+}
+
+#[cfg(feature = "fetch-collateral")]
+async fn fetch_snp_async(evidence: &[u8], opts: &SnpCollateralOptions) -> Result<Vec<Endorsement>> {
+    let fields = parse_snp_evidence(evidence)?;
+    let product = opts.product_name.as_deref().unwrap_or(&fields.product_name);
+    let kds = &opts.kds_base_url;
+
+    let client = reqwest::Client::new();
+
+    let vcek_url = format!(
+        "{kds}/vcek/v1/{product}/{}?blSPL={}&teeSPL={}&snpSPL={}&ucodeSPL={}",
+        fields.chip_id_hex, fields.bl_svn, fields.tee_svn, fields.snp_svn, fields.ucode_svn,
+    );
+    let vcek_bytes = client
+        .get(&vcek_url)
+        .send()
+        .await
+        .with_context(|| format!("GET {vcek_url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP error from {vcek_url}"))?
+        .bytes()
+        .await
         .context("read VCEK cert body")?
         .to_vec();
 
@@ -498,6 +539,22 @@ fn fetch_dcap_collateral_endorsement(
     dcap_collateral_endorsement(label, media_type, &collateral)
 }
 
+#[cfg(feature = "fetch-collateral")]
+async fn fetch_dcap_collateral_endorsement_async(
+    evidence: &[u8],
+    tee: &str,
+    label: &str,
+    media_type: &str,
+    pccs_base_url: &str,
+) -> Result<Endorsement> {
+    let quote = quote_bytes_from_dcap_evidence(evidence, tee)?;
+    let collateral = fetch_quote_collateral(&quote, pccs_base_url)
+        .await
+        .with_context(|| format!("fetch {tee} collateral from {pccs_base_url}"))?;
+
+    dcap_collateral_endorsement(label, media_type, &collateral)
+}
+
 /// Fetch full DCAP collateral for a quote.
 ///
 /// `dcap_qvl::collateral::get_collateral` rejects PCK responses whose
@@ -662,6 +719,20 @@ fn fetch_tdx(evidence: &[u8], opts: &TdxCollateralOptions) -> Result<Vec<Endorse
     )?])
 }
 
+#[cfg(feature = "fetch-collateral")]
+async fn fetch_tdx_async(evidence: &[u8], opts: &TdxCollateralOptions) -> Result<Vec<Endorsement>> {
+    Ok(vec![
+        fetch_dcap_collateral_endorsement_async(
+            evidence,
+            "TDX",
+            TDX_COLLATERAL_LABEL,
+            TDX_COLLATERAL_MEDIA_TYPE,
+            &opts.pccs_base_url,
+        )
+        .await?,
+    ])
+}
+
 #[cfg(not(feature = "fetch-collateral"))]
 fn fetch_tdx(_evidence: &[u8], _opts: &TdxCollateralOptions) -> Result<Vec<Endorsement>> {
     anyhow::bail!("collateral fetching requires the `fetch-collateral` Cargo feature")
@@ -678,6 +749,20 @@ fn fetch_sgx(evidence: &[u8], opts: &SgxCollateralOptions) -> Result<Vec<Endorse
         SGX_COLLATERAL_MEDIA_TYPE,
         &opts.pccs_base_url,
     )?])
+}
+
+#[cfg(feature = "fetch-collateral")]
+async fn fetch_sgx_async(evidence: &[u8], opts: &SgxCollateralOptions) -> Result<Vec<Endorsement>> {
+    Ok(vec![
+        fetch_dcap_collateral_endorsement_async(
+            evidence,
+            "SGX",
+            SGX_COLLATERAL_LABEL,
+            SGX_COLLATERAL_MEDIA_TYPE,
+            &opts.pccs_base_url,
+        )
+        .await?,
+    ])
 }
 
 #[cfg(not(feature = "fetch-collateral"))]

@@ -1,4 +1,6 @@
 pub mod collateral;
+#[cfg(feature = "fetch-collateral")]
+pub use collateral::fetch_collateral_async;
 pub use collateral::{
     fetch_collateral, CollateralSource, SgxCollateralOptions, SnpCollateralOptions,
     TdxCollateralOptions,
@@ -452,6 +454,26 @@ impl BuildInputBuilder {
     pub fn endorsement(mut self, endorsement: Endorsement) -> Self {
         self.endorsements.push(endorsement);
         self
+    }
+
+    /// Fetch collateral for the current evidence and attach it as endorsements.
+    #[cfg(feature = "fetch-collateral")]
+    pub fn fetch_collateral(mut self, source: CollateralSource) -> anyhow::Result<Self> {
+        let fetched = crate::fetch_collateral(&self.evidence, &source)?;
+        self.endorsements.extend(fetched);
+        Ok(self)
+    }
+
+    /// Async variant of [`Self::fetch_collateral`] for callers already running
+    /// inside an async runtime.
+    #[cfg(feature = "fetch-collateral")]
+    pub async fn fetch_collateral_async(
+        mut self,
+        source: CollateralSource,
+    ) -> anyhow::Result<Self> {
+        let fetched = crate::fetch_collateral_async(&self.evidence, &source).await?;
+        self.endorsements.extend(fetched);
+        Ok(self)
     }
 
     pub fn build(self) -> Result<BuildInput> {
@@ -1120,7 +1142,8 @@ pub mod trustmee_coco_client {
             let evidence = self
                 .fetch_evidence_bytes(options.build_options.runtime_data.as_deref())
                 .await?;
-            let fetched = crate::fetch_collateral(&evidence, &options.collateral_source)?;
+            let fetched =
+                crate::fetch_collateral_async(&evidence, &options.collateral_source).await?;
             let mut input = options.build_options.into_build_input(evidence);
             input.endorsements.extend(fetched);
             Ok(build_trustmee_json_cmw(&input)?)
