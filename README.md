@@ -27,6 +27,29 @@ std::fs::write("input.cmw.json", built.cmw_json_bytes)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### Async / sync summary
+
+| Function | Async? | Notes |
+|---|---|---|
+| `build_trustmee_json_cmw` | sync (safe everywhere) | Pure in-memory JSON assembly — no I/O, no runtime required. |
+| `build_rest_attestation_body` | sync (safe everywhere) | Same — pure serialisation. |
+| `BuildInputBuilder::fetch_collateral` | **sync — CLI only** | Spins up its own Tokio runtime internally. **Panics** if called from inside an existing async runtime. |
+| `BuildInputBuilder::fetch_collateral_async` | async | Use this in all library code. |
+| `CocoClient::build_trustmee_json_cmw_coco` | async only | Always `.await`. No sync variant. |
+| `CocoClient::build_trustmee_json_cmw_coco_with_collateral` | async only | Always `.await`. Calls `fetch_collateral_async` internally — no additional work needed. |
+
+**The only trap is `BuildInputBuilder::fetch_collateral` vs `fetch_collateral_async`.**  When using the crate as a library (i.e. inside a Tokio async runtime), always use the async variant:
+
+```rust
+let input = BuildInput::builder(evidence)
+    .component(component_bytes)
+    .fetch_collateral_async(collateral_source)   // ← async; use .await
+    .await?
+    .build()?;
+```
+
+The sync `.fetch_collateral()` exists only for the CLI entrypoint, which runs outside any async runtime.
+
 ### Obtaining attestation evidence in Confidential Containers
 
 In your main project's `Cargo.toml` enable the `confidential-containers` feature for this crate under `[dependencies]`.
